@@ -4,3 +4,11 @@ data/
 *.user
 *.env
 .env
+/harness/
+/testdata/
+node_modules/
+.vs/
+.env.*
+!.env.example
+admin-password.json
+admin-password.json.tmp
