@@ -5,8 +5,10 @@ using Microsoft.Data.Sqlite;
 
 namespace ServerPilot;
 
-public sealed record ServerInput(string? Name, string? Host, int Port, string? Username, string? AuthType, string? Password, string? PrivateKey, string? Passphrase, string? HostFingerprint, string? Tags, string? Notes);
-public sealed record ServerView(string Id, string Name, string Host, int Port, string Username, string AuthType, string HostFingerprint, string Tags, string Notes, string UpdatedAt);
+public sealed record ServerInput(string? Name, string? Host, int Port, string? Username, string? AuthType, string? Password, string? PrivateKey, string? Passphrase, string? HostFingerprint, string? Tags, string? Notes,
+    bool UseServiceKey = false, bool TryKeyboard = false, string? Proxy = null, string? AllowedRemotePaths = null);
+public sealed record ServerView(string Id, string Name, string Host, int Port, string Username, string AuthType, string HostFingerprint, string Tags, string Notes, string UpdatedAt,
+    bool UseServiceKey, bool TryKeyboard, string Proxy, string AllowedRemotePaths);
 public sealed record Credential(string? Password, string? PrivateKey, string? Passphrase);
 public sealed record StoredServer(ServerView View, Credential Credential);
 
@@ -28,29 +30,48 @@ public sealed class ServerStore(AppOptions options)
                 id TEXT PRIMARY KEY, name TEXT NOT NULL COLLATE NOCASE UNIQUE, host TEXT NOT NULL,
                 port INTEGER NOT NULL, username TEXT NOT NULL, auth_type TEXT NOT NULL,
                 host_fingerprint TEXT NOT NULL, tags TEXT NOT NULL, notes TEXT NOT NULL,
-                credential TEXT NOT NULL, updated_at TEXT NOT NULL);
+                credential TEXT NOT NULL, updated_at TEXT NOT NULL,
+                use_service_key INTEGER NOT NULL DEFAULT 0, try_keyboard INTEGER NOT NULL DEFAULT 0, proxy TEXT NOT NULL DEFAULT '',
+                allowed_remote_paths TEXT NOT NULL DEFAULT '');
             CREATE TABLE IF NOT EXISTS audit(
                 id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, actor TEXT NOT NULL,
                 server_name TEXT NOT NULL, action TEXT NOT NULL, result TEXT NOT NULL);
             """;
         cmd.ExecuteNonQuery();
+        EnsureColumns(c);
         if (!OperatingSystem.IsWindows()) File.SetUnixFileMode(Path.Combine(options.DataDirectory, "serverpilot.db"), UnixFileMode.UserRead | UnixFileMode.UserWrite);
     }
-    private static ServerView View(SqliteDataReader r) => new(r.GetString(0), r.GetString(1), r.GetString(2), r.GetInt32(3), r.GetString(4), r.GetString(5), r.GetString(6), r.GetString(7), r.GetString(8), r.GetString(9));
+    private static void EnsureColumns(SqliteConnection c)
+    {
+        using var info = c.CreateCommand(); info.CommandText = "PRAGMA table_info(servers)";
+        var columns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        using (var r = info.ExecuteReader()) while (r.Read()) columns.Add(r.GetString(1));
+        foreach (var (name, ddl) in new[] {
+            ("use_service_key", "ALTER TABLE servers ADD COLUMN use_service_key INTEGER NOT NULL DEFAULT 0"),
+            ("try_keyboard", "ALTER TABLE servers ADD COLUMN try_keyboard INTEGER NOT NULL DEFAULT 0"),
+            ("proxy", "ALTER TABLE servers ADD COLUMN proxy TEXT NOT NULL DEFAULT ''"),
+            ("allowed_remote_paths", "ALTER TABLE servers ADD COLUMN allowed_remote_paths TEXT NOT NULL DEFAULT ''") })
+        {
+            if (columns.Contains(name)) continue;
+            using var alter = c.CreateCommand(); alter.CommandText = ddl; alter.ExecuteNonQuery();
+        }
+    }
+    private static ServerView View(SqliteDataReader r) => new(r.GetString(0), r.GetString(1), r.GetString(2), r.GetInt32(3), r.GetString(4), r.GetString(5), r.GetString(6), r.GetString(7), r.GetString(8), r.GetString(9),
+        r.GetInt32(10) != 0, r.GetInt32(11) != 0, r.GetString(12), r.GetString(13));
     public List<ServerView> List()
     {
         using var c = Open(); using var cmd = c.CreateCommand();
-        cmd.CommandText = "SELECT id,name,host,port,username,auth_type,host_fingerprint,tags,notes,updated_at FROM servers ORDER BY name";
+        cmd.CommandText = "SELECT id,name,host,port,username,auth_type,host_fingerprint,tags,notes,updated_at,use_service_key,try_keyboard,proxy,allowed_remote_paths FROM servers ORDER BY name";
         using var r = cmd.ExecuteReader(); var rows = new List<ServerView>(); while (r.Read()) rows.Add(View(r)); return rows;
     }
     public StoredServer Get(string idOrName)
     {
         using var c = Open(); using var cmd = c.CreateCommand();
-        cmd.CommandText = "SELECT id,name,host,port,username,auth_type,host_fingerprint,tags,notes,updated_at,credential FROM servers WHERE id=$id OR name=$id COLLATE NOCASE";
+        cmd.CommandText = "SELECT id,name,host,port,username,auth_type,host_fingerprint,tags,notes,updated_at,use_service_key,try_keyboard,proxy,allowed_remote_paths,credential FROM servers WHERE id=$id OR name=$id COLLATE NOCASE";
         cmd.Parameters.AddWithValue("$id", idOrName);
         using var r = cmd.ExecuteReader();
         if (!r.Read()) throw new ArgumentException("找不到指定服务器。请使用服务器 ID 或名称。");
-        return new(View(r), Decrypt(r.GetString(10)));
+        return new(View(r), Decrypt(r.GetString(14)));
     }
     public ServerView Save(string? id, ServerInput input)
     {
@@ -61,29 +82,39 @@ public sealed class ServerStore(AppOptions options)
         if (input.Port is < 1 or > 65535) throw new ArgumentException("SSH 端口无效。");
         if (auth is not ("password" or "privateKey")) throw new ArgumentException("请选择密码或私钥认证。");
         if (host.Any(char.IsWhiteSpace) || host.Contains('/') || host.Contains('@')) throw new ArgumentException("服务器地址无效。");
+        var proxy = (input.Proxy ?? "").Trim();
+        if (proxy.Length > 2048 || proxy.Contains('\0')) throw new ArgumentException("代理地址无效。");
+        if (proxy.Length > 0) ValidateProxy(proxy);
+        var allowedRemote = NormalizeRemoteRoots(input.AllowedRemotePaths);
         var previous = id is null ? null : Get(id);
         var sameAuth = previous?.View.AuthType == auth;
         var credential = auth == "password"
             ? new Credential(!string.IsNullOrEmpty(input.Password) ? input.Password : sameAuth ? previous?.Credential.Password : null, null, null)
             : new Credential(null, !string.IsNullOrWhiteSpace(input.PrivateKey) ? input.PrivateKey : sameAuth ? previous?.Credential.PrivateKey : null,
                 !string.IsNullOrEmpty(input.PrivateKey) ? input.Passphrase : !string.IsNullOrEmpty(input.Passphrase) ? input.Passphrase : sameAuth ? previous?.Credential.Passphrase : null);
-        if (auth == "password" && string.IsNullOrEmpty(credential.Password)) throw new ArgumentException("请输入 SSH 密码。");
-        if (auth == "privateKey" && string.IsNullOrWhiteSpace(credential.PrivateKey)) throw new ArgumentException("请输入 SSH 私钥。");
+        if (!input.UseServiceKey)
+        {
+            if (auth == "password" && string.IsNullOrEmpty(credential.Password)) throw new ArgumentException("请输入 SSH 密码。");
+            if (auth == "privateKey" && string.IsNullOrWhiteSpace(credential.PrivateKey)) throw new ArgumentException("请输入 SSH 私钥。");
+        }
         if ((credential.Password?.Length ?? 0) > 4096 || (credential.PrivateKey?.Length ?? 0) > 65536 || (credential.Passphrase?.Length ?? 0) > 4096) throw new ArgumentException("凭据过长。");
         id ??= Guid.NewGuid().ToString("N");
         var updated = DateTimeOffset.UtcNow.ToString("O");
         using var c = Open(); using var cmd = c.CreateCommand();
         cmd.CommandText = """
-            INSERT INTO servers (id,name,host,port,username,auth_type,host_fingerprint,tags,notes,credential,updated_at)
-            VALUES ($id,$name,$host,$port,$username,$auth,$fp,$tags,$notes,$credential,$updated)
+            INSERT INTO servers (id,name,host,port,username,auth_type,host_fingerprint,tags,notes,credential,updated_at,use_service_key,try_keyboard,proxy,allowed_remote_paths)
+            VALUES ($id,$name,$host,$port,$username,$auth,$fp,$tags,$notes,$credential,$updated,$serviceKey,$keyboard,$proxy,$allowed)
             ON CONFLICT(id) DO UPDATE SET name=$name,host=$host,port=$port,username=$username,auth_type=$auth,
-              host_fingerprint=$fp,tags=$tags,notes=$notes,credential=$credential,updated_at=$updated
+              host_fingerprint=$fp,tags=$tags,notes=$notes,credential=$credential,updated_at=$updated,
+              use_service_key=$serviceKey,try_keyboard=$keyboard,proxy=$proxy,allowed_remote_paths=$allowed
             """;
         foreach (var (k,v) in new Dictionary<string, object> { ["$id"]=id, ["$name"]=name, ["$host"]=host, ["$port"]=input.Port, ["$username"]=username,
-            ["$auth"]=auth, ["$fp"]=fingerprint, ["$tags"]=Optional(input.Tags, 300), ["$notes"]=Optional(input.Notes, 1000), ["$credential"]=Encrypt(credential), ["$updated"]=updated }) cmd.Parameters.AddWithValue(k,v);
+            ["$auth"]=auth, ["$fp"]=fingerprint, ["$tags"]=Optional(input.Tags, 300), ["$notes"]=Optional(input.Notes, 1000), ["$credential"]=Encrypt(credential), ["$updated"]=updated,
+            ["$serviceKey"]=input.UseServiceKey ? 1 : 0, ["$keyboard"]=input.TryKeyboard ? 1 : 0, ["$proxy"]=proxy, ["$allowed"]=allowedRemote }) cmd.Parameters.AddWithValue(k,v);
         try { cmd.ExecuteNonQuery(); } catch (SqliteException e) when (e.SqliteErrorCode == 19) { throw new ArgumentException("服务器名称已存在。"); }
         Audit("web", name, previous is null ? "server.create" : "server.update", "success");
-        return new(id, name, host, input.Port, username, auth, fingerprint, Optional(input.Tags, 300), Optional(input.Notes, 1000), updated);
+        return new(id, name, host, input.Port, username, auth, fingerprint, Optional(input.Tags, 300), Optional(input.Notes, 1000), updated,
+            input.UseServiceKey, input.TryKeyboard, proxy, allowedRemote);
     }
     public void Delete(string id)
     {
@@ -120,4 +151,24 @@ public sealed class ServerStore(AppOptions options)
     }
     private static string Required(string? v, string label, int max) => string.IsNullOrWhiteSpace(v) || v.Trim().Length > max ? throw new ArgumentException($"{label}不能为空且长度不能超过 {max}。") : v.Trim();
     private static string Optional(string? v, int max) => (v ?? "").Trim().Length > max ? throw new ArgumentException("输入内容过长。") : (v ?? "").Trim();
+
+    public static void ValidateProxy(string proxy)
+    {
+        if (!Uri.TryCreate(proxy, UriKind.Absolute, out var uri) ||
+            uri.Scheme is not ("socks4" or "socks5" or "http") ||
+            string.IsNullOrWhiteSpace(uri.Host))
+            throw new ArgumentException("代理应使用 socks5://、socks4:// 或 http:// 地址。HTTPS 代理请改用可用的 HTTP CONNECT 代理。");
+        if (uri.Port is < 1 or > 65535) throw new ArgumentException("代理端口无效。");
+        if (!string.IsNullOrEmpty(uri.UserInfo)) throw new ArgumentException("暂不支持带凭据的代理地址，请勿在此输入代理密码。");
+        if (!string.IsNullOrEmpty(uri.AbsolutePath) && uri.AbsolutePath != "/") throw new ArgumentException("代理地址不应包含路径。");
+    }
+
+    public static string NormalizeRemoteRoots(string? value)
+    {
+        var roots = (value ?? "").Split('\n', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries).Distinct(StringComparer.Ordinal).ToList();
+        foreach (var root in roots)
+            if (!root.StartsWith('/') || root.Length > 4096 || root.Contains('\0') || root.Contains("..", StringComparison.Ordinal))
+                throw new ArgumentException("远端允许路径必须是 Linux 绝对路径，且不能包含 ..。每行一个。");
+        return string.Join('\n', roots);
+    }
 }

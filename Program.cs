@@ -47,6 +47,7 @@ using (var keyCheck = new FileStream(keyCheckPath, FileMode.OpenOrCreate, FileAc
     }
 }
 builder.Services.AddSingleton(options);
+builder.Services.AddSingleton<AdminPasswordStore>();
 builder.Services.AddSingleton<ServerStore>();
 builder.Services.AddSingleton<SshOperations>();
 builder.Services.AddSingleton<JobService>();
@@ -66,6 +67,15 @@ builder.Services.AddAuthentication(CookieAuthenticationDefaults.AuthenticationSc
     o.SlidingExpiration = false;
     o.Events.OnRedirectToLogin = c => { c.Response.StatusCode = 401; return Task.CompletedTask; };
     o.Events.OnRedirectToAccessDenied = c => { c.Response.StatusCode = 403; return Task.CompletedTask; };
+    o.Events.OnValidatePrincipal = async context =>
+    {
+        var passwords = context.HttpContext.RequestServices.GetRequiredService<AdminPasswordStore>();
+        if (context.Principal?.FindFirst("password-version")?.Value != passwords.Version)
+        {
+            context.RejectPrincipal();
+            await context.HttpContext.SignOutAsync();
+        }
+    };
 });
 builder.Services.AddAuthorization();
 builder.Services.AddRateLimiter(o => o.AddFixedWindowLimiter("login", l =>
@@ -107,10 +117,11 @@ app.UseAuthorization();
 app.UseDefaultFiles();
 app.UseStaticFiles();
 
-app.MapPost("/api/login", async (LoginInput input, HttpContext ctx) =>
+app.MapPost("/api/login", async (LoginInput input, AdminPasswordStore passwords, HttpContext ctx) =>
 {
-    if (!Secrets.Equal(input.Password ?? "", options.AdminPassword)) return Results.Unauthorized();
-    var identity = new ClaimsIdentity([new Claim(ClaimTypes.Name, "admin")], CookieAuthenticationDefaults.AuthenticationScheme);
+    var version = passwords.Authenticate(input.Password ?? "");
+    if (version is null) return Results.Unauthorized();
+    var identity = new ClaimsIdentity([new Claim(ClaimTypes.Name, "admin"), new Claim("password-version", version)], CookieAuthenticationDefaults.AuthenticationScheme);
     await ctx.SignInAsync(CookieAuthenticationDefaults.AuthenticationScheme, new ClaimsPrincipal(identity));
     return Results.Ok(new { ok = true });
 }).RequireRateLimiting("login");
@@ -119,6 +130,25 @@ app.MapPost("/api/logout", async (HttpContext ctx) => { await ctx.SignOutAsync()
 
 var api = app.MapGroup("/api").RequireAuthorization();
 api.MapGet("/servers", (ServerStore store) => Results.Ok(store.List()));
+api.MapPost("/password", async (PasswordChangeInput input, AdminPasswordStore passwords, HttpContext ctx) =>
+{
+    if (string.IsNullOrWhiteSpace(input.NewPassword) || input.NewPassword.Length is < 8 or > 1024) return Results.BadRequest(new { error = "新密码需要 8–1024 个字符，不能全为空格。" });
+    if (!Secrets.Equal(input.NewPassword, input.ConfirmPassword ?? "")) return Results.BadRequest(new { error = "两次输入的新密码不一致。" });
+    if (Secrets.Equal(input.NewPassword, options.McpToken)) return Results.BadRequest(new { error = "管理员密码不能与 MCP 令牌相同。" });
+    try
+    {
+        if (!passwords.Change(input.CurrentPassword ?? "", input.NewPassword)) return Results.BadRequest(new { error = "当前密码不正确。" });
+    }
+    catch (IOException) { return Results.Problem("密码保存失败，请检查数据目录权限。", statusCode: 500); }
+    catch (UnauthorizedAccessException) { return Results.Problem("密码保存失败，请检查数据目录权限。", statusCode: 500); }
+    await ctx.SignOutAsync();
+    return Results.Ok(new { changed = true });
+}).RequireRateLimiting("login");
+api.MapPost("/mcp-token/reveal", (TokenRevealInput input, AdminPasswordStore passwords, AppOptions options) =>
+{
+    if (!passwords.Verify(input.Password ?? "")) return Results.BadRequest(new { error = "管理员密码不正确。" });
+    return Results.Ok(new { token = options.McpToken });
+}).RequireRateLimiting("login");
 api.MapPost("/servers/probe", async (ProbeInput input, SshOperations ssh) => await SafeAsync(async () => Results.Ok(await ssh.Probe(input.Host, input.Port))));
 api.MapPost("/servers", (ServerInput input, ServerStore store) => Safe(() => Results.Ok(store.Save(null, input))));
 api.MapPut("/servers/{id}", (string id, ServerInput input, ServerStore store) => Safe(() => Results.Ok(store.Save(id, input))));
@@ -139,6 +169,12 @@ api.MapGet("/files/{name}", (string name, SshOperations ssh) => Safe(() => Resul
 api.MapDelete("/files/{name}", (string name, SshOperations ssh) => Safe(() => { ssh.DeleteStaged(name); return Results.Ok(); }));
 api.MapPost("/servers/{id}/upload", async (string id, TransferInput input, SshOperations ssh) => await SafeAsync(async () => Results.Ok(await ssh.Upload(id, input.StagingFile, input.RemotePath, "web"))));
 api.MapPost("/servers/{id}/download", async (string id, TransferInput input, SshOperations ssh) => await SafeAsync(async () => Results.Ok(await ssh.Download(id, input.RemotePath, input.StagingFile, "web"))));
+api.MapPost("/servers/{id}/read-file", async (string id, ReadFileInput input, SshOperations ssh) => await SafeAsync(async () => Results.Ok(await ssh.ReadFile(id, input.RemotePath, input.Offset, input.Length, "web"))));
+api.MapPost("/servers/{id}/write-file", async (string id, WriteFileInput input, SshOperations ssh) => await SafeAsync(async () => Results.Ok(await ssh.WriteFile(id, input.RemotePath, input.Content, input.Append, input.Mode, "web"))));
+api.MapPost("/servers/{id}/jobs", (string id, JobInput input, JobService jobs) => Safe(() => Results.Ok(jobs.Start(id, input.Command, input.TimeoutSeconds))));
+api.MapGet("/servers/{id}/jobs", (string id, JobService jobs) => Safe(() => Results.Ok(jobs.List(id, 50))));
+api.MapGet("/servers/{id}/jobs/{jobId}", (string id, string jobId, JobService jobs) => Safe(() => Results.Ok(jobs.Status(id, jobId, null))));
+api.MapPost("/servers/{id}/jobs/{jobId}/kill", (string id, string jobId, JobService jobs) => Safe(() => Results.Ok(jobs.Kill(id, jobId))));
 app.MapMcp("/mcp");
 app.Run();
 
@@ -153,27 +189,94 @@ static async Task<IResult> SafeAsync(Func<Task<IResult>> action)
     catch (Exception e) { return Results.BadRequest(new { error = Errors.Public(e) }); }
 }
 record LoginInput(string? Password);
+record PasswordChangeInput(string? CurrentPassword, string? NewPassword, string? ConfirmPassword);
+record TokenRevealInput(string? Password);
 record CommandInput(string Command, int TimeoutSeconds = 60);
 record TransferInput(string StagingFile, string RemotePath);
 record ProbeInput(string Host, int Port);
+record JobInput(string Command, int TimeoutSeconds = 600);
+record ReadFileInput(string RemotePath, long Offset = 0, int Length = 65536);
+record WriteFileInput(string RemotePath, string Content, bool Append = false, int? Mode = null);
 
 namespace ServerPilot
 {
-    public sealed record AppOptions(string DataDirectory, string StagingDirectory, string AdminPassword, string McpToken, byte[] EncryptionKey, string[] AllowedHosts)
+    public sealed class AdminPasswordStore
+    {
+        private readonly string path;
+        private string salt;
+        private string hash;
+        private readonly object gate = new();
+        public AdminPasswordStore(AppOptions options)
+        {
+            path = Path.Combine(options.DataDirectory, "admin-password.json");
+            if (File.Exists(path))
+            {
+                var saved = System.Text.Json.JsonSerializer.Deserialize<PasswordFile>(File.ReadAllText(path));
+                if (saved is null || string.IsNullOrWhiteSpace(saved.Salt) || string.IsNullOrWhiteSpace(saved.Hash)) throw new InvalidOperationException("管理员密码文件损坏。");
+                salt = saved.Salt; hash = saved.Hash;
+            }
+            else { salt = Convert.ToBase64String(RandomNumberGenerator.GetBytes(16)); hash = Derive(options.AdminPassword, salt); Save(); }
+        }
+        public string Version { get { lock (gate) return salt; } }
+        public bool Verify(string value) => Authenticate(value) is not null;
+        public string? Authenticate(string value)
+        {
+            if (value.Length > 1024) return null;
+            lock (gate) return Secrets.Equal(hash, Derive(value, salt)) ? salt : null;
+        }
+        public bool Change(string current, string value)
+        {
+            lock (gate)
+            {
+                if (Authenticate(current) is null) return false;
+                var nextSalt = Convert.ToBase64String(RandomNumberGenerator.GetBytes(16));
+                var nextHash = Derive(value, nextSalt);
+                Save(nextSalt, nextHash);
+                salt = nextSalt; hash = nextHash;
+                return true;
+            }
+        }
+        private void Save() => Save(salt, hash);
+        private void Save(string savedSalt, string savedHash)
+        {
+            var temp = path + ".tmp";
+            File.WriteAllText(temp, System.Text.Json.JsonSerializer.Serialize(new PasswordFile(savedSalt, savedHash)));
+            if (!OperatingSystem.IsWindows()) File.SetUnixFileMode(temp, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+            File.Move(temp, path, true);
+        }
+        private static string Derive(string value, string salt)
+        {
+            using var derive = new Rfc2898DeriveBytes(value, Convert.FromBase64String(salt), 150_000, HashAlgorithmName.SHA256);
+            return Convert.ToBase64String(derive.GetBytes(32));
+        }
+        private sealed record PasswordFile(string Salt, string Hash);
+    }
+
+    public sealed record AppOptions(string DataDirectory, string StagingDirectory, string AdminPassword, string McpToken, byte[] EncryptionKey, string[] AllowedHosts,
+        string? TwoFactorCode, string? ServiceKeyPath, string? ServiceKeyPassphrase)
     {
         public static AppOptions Load(IConfiguration c, string root)
         {
             var admin = c["SERVERPILOT_ADMIN_PASSWORD"] ?? "";
             var token = c["SERVERPILOT_MCP_TOKEN"] ?? "";
             var key = c["SERVERPILOT_ENCRYPTION_KEY"] ?? "";
-            if (admin.Length < 16 || token.Length < 32 || Secrets.Equal(admin, token))
-                throw new InvalidOperationException("Set distinct SERVERPILOT_ADMIN_PASSWORD (at least 16 characters) and SERVERPILOT_MCP_TOKEN (at least 32 characters).");
+            if (admin.Length < 8 || token.Length < 32 || Secrets.Equal(admin, token))
+                throw new InvalidOperationException("Set distinct SERVERPILOT_ADMIN_PASSWORD (at least 8 characters) and SERVERPILOT_MCP_TOKEN (at least 32 characters).");
             byte[] bytes;
             try { bytes = Convert.FromBase64String(key); } catch { throw new InvalidOperationException("SERVERPILOT_ENCRYPTION_KEY must be base64 for 32 random bytes."); }
             if (bytes.Length != 32) throw new InvalidOperationException("SERVERPILOT_ENCRYPTION_KEY must be base64 for 32 random bytes.");
             var dir = Path.GetFullPath(c["SERVERPILOT_DATA_DIR"] ?? Path.Combine(root, "data"));
             var hosts = (c["SERVERPILOT_ALLOWED_HOSTS"] ?? "localhost,127.0.0.1,::1").Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
-            return new(dir, Path.Combine(dir, "staging"), admin, token, bytes, hosts);
+            var twoFactor = c["SERVERPILOT_2FA_CODE"];
+            if (!string.IsNullOrEmpty(twoFactor) && twoFactor.Length > 128) throw new InvalidOperationException("SERVERPILOT_2FA_CODE 过长。");
+            var serviceKey = c["SERVERPILOT_SERVICE_KEY_PATH"] ?? c["SERVERPILOT_AGENT_KEY_PATH"];
+            if (!string.IsNullOrWhiteSpace(serviceKey) && (!File.Exists(serviceKey) || serviceKey.Length > 2048))
+                throw new InvalidOperationException("SERVERPILOT_SERVICE_KEY_PATH 指向的文件不存在。");
+            var servicePassphrase = c["SERVERPILOT_SERVICE_KEY_PASSPHRASE"];
+            if (!string.IsNullOrEmpty(servicePassphrase) && servicePassphrase.Length > 4096)
+                throw new InvalidOperationException("SERVERPILOT_SERVICE_KEY_PASSPHRASE 过长。");
+            return new(dir, Path.Combine(dir, "staging"), admin, token, bytes, hosts, string.IsNullOrWhiteSpace(twoFactor) ? null : twoFactor.Trim(),
+                string.IsNullOrWhiteSpace(serviceKey) ? null : Path.GetFullPath(serviceKey), string.IsNullOrEmpty(servicePassphrase) ? null : servicePassphrase);
         }
     }
     public static class Secrets
