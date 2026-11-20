@@ -114,4 +114,7 @@ header { background: transparent; border: 0; height: 64px; }
 }
 .security-panel { max-width: 600px; }
 .audit-pagination { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:16px 26px; color:#738194; font-size:12px; }
-.audit-pagination > div { display:flex; gap:8px; flex-wrap:wrap; }
+.audit-pagination > div, .shared-key-actions { display:flex; gap:8px; flex-wrap:wrap; }
+.shared-key-manager { padding:14px; margin-bottom:16px; border:1px solid var(--line); border-radius:10px; }
+.shared-key-manager summary { cursor:pointer; color:#5277a2; font-size:12px; font-weight:600; }
+.shared-key-manager[open] summary { margin-bottom:16px; }

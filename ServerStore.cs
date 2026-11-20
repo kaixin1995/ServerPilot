@@ -6,7 +6,8 @@ using Microsoft.Data.Sqlite;
 namespace ServerPilot;
 
 public sealed record ServerInput(string? Name, string? Host, int Port, string? Username, string? AuthType, string? Password, string? PrivateKey, string? Passphrase, string? HostFingerprint, string? Tags, string? Notes,
-    bool UseServiceKey = false, bool TryKeyboard = false, string? Proxy = null, string? AllowedRemotePaths = null);
+    bool UseServiceKey = false, bool TryKeyboard = false, string? Proxy = null, string? AllowedRemotePaths = null, string? SharedKeyId = null);
+public sealed record SharedKeyInput(string? Name, string? PrivateKey, string? Passphrase);
 public sealed record ServerView(string Id, string Name, string Host, int Port, string Username, string AuthType, string HostFingerprint, string Tags, string Notes, string UpdatedAt,
     bool UseServiceKey, bool TryKeyboard, string Proxy, string AllowedRemotePaths);
 public sealed record Credential(string? Password, string? PrivateKey, string? Passphrase);
@@ -37,6 +38,8 @@ public sealed class ServerStore(AppOptions options)
                 id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, actor TEXT NOT NULL,
                 server_name TEXT NOT NULL, action TEXT NOT NULL, result TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS audit_at_idx ON audit(at);
+            CREATE TABLE IF NOT EXISTS shared_keys(
+                id TEXT PRIMARY KEY, name TEXT NOT NULL COLLATE NOCASE UNIQUE, credential TEXT NOT NULL, created_at TEXT NOT NULL);
             """;
         cmd.ExecuteNonQuery();
         EnsureColumns(c);
@@ -94,6 +97,7 @@ public sealed class ServerStore(AppOptions options)
             ? new Credential(!string.IsNullOrEmpty(input.Password) ? input.Password : sameAuth ? previous?.Credential.Password : null, null, null)
             : new Credential(null, !string.IsNullOrWhiteSpace(input.PrivateKey) ? input.PrivateKey : sameAuth ? previous?.Credential.PrivateKey : null,
                 !string.IsNullOrEmpty(input.PrivateKey) ? input.Passphrase : !string.IsNullOrEmpty(input.Passphrase) ? input.Passphrase : sameAuth ? previous?.Credential.Passphrase : null);
+        if (auth == "privateKey" && !string.IsNullOrWhiteSpace(input.SharedKeyId)) credential = GetSharedKey(input.SharedKeyId);
         if (!input.UseServiceKey)
         {
             if (auth == "password" && string.IsNullOrEmpty(credential.Password)) throw new ArgumentException("请输入 SSH 密码。");
@@ -145,6 +149,33 @@ public sealed class ServerStore(AppOptions options)
         cmd.Parameters.AddWithValue("$limit", pageSize); cmd.Parameters.AddWithValue("$offset", ((long)page - 1) * pageSize);
         using var r = cmd.ExecuteReader(); var rows = new List<object>(); while (r.Read()) rows.Add(new { at=r.GetString(0), actor=r.GetString(1), server=r.GetString(2), action=r.GetString(3), result=r.GetString(4) });
         return new { items = rows, page, pageSize, total, totalPages };
+    }
+    public object ListSharedKeys()
+    {
+        using var c = Open(); using var cmd = c.CreateCommand(); cmd.CommandText = "SELECT id,name,created_at FROM shared_keys ORDER BY name";
+        using var r = cmd.ExecuteReader(); var rows = new List<object>(); while (r.Read()) rows.Add(new { id = r.GetString(0), name = r.GetString(1), createdAt = r.GetString(2) }); return rows;
+    }
+    private Credential GetSharedKey(string id)
+    {
+        using var c = Open(); using var cmd = c.CreateCommand(); cmd.CommandText = "SELECT credential FROM shared_keys WHERE id=$id"; cmd.Parameters.AddWithValue("$id", id);
+        var encrypted = cmd.ExecuteScalar() as string ?? throw new ArgumentException("找不到指定的共享私钥。"); return Decrypt(encrypted);
+    }
+    public object AddSharedKey(SharedKeyInput input)
+    {
+        var name = Required(input.Name, "密钥名称", 80); var privateKey = input.PrivateKey;
+        if (string.IsNullOrWhiteSpace(privateKey) || privateKey.Length > 65536 || (input.Passphrase?.Length ?? 0) > 4096) throw new ArgumentException("私钥为空或过长。");
+        try { using var stream = new MemoryStream(Encoding.UTF8.GetBytes(privateKey)); using var key = string.IsNullOrEmpty(input.Passphrase) ? new Renci.SshNet.PrivateKeyFile(stream) : new Renci.SshNet.PrivateKeyFile(stream, input.Passphrase); }
+        catch (Exception exception) when (exception is Renci.SshNet.Common.SshException or CryptographicException or ArgumentException or FormatException) { throw new ArgumentException("无法读取私钥，请检查文件格式和口令。"); }
+        var id = Guid.NewGuid().ToString("N"); using var c = Open(); using var cmd = c.CreateCommand();
+        cmd.CommandText = "INSERT INTO shared_keys(id,name,credential,created_at) VALUES($id,$name,$credential,$created)";
+        cmd.Parameters.AddWithValue("$id", id); cmd.Parameters.AddWithValue("$name", name); cmd.Parameters.AddWithValue("$credential", Encrypt(new Credential(null, privateKey, input.Passphrase))); cmd.Parameters.AddWithValue("$created", DateTimeOffset.UtcNow.ToString("O"));
+        try { cmd.ExecuteNonQuery(); } catch (SqliteException exception) when (exception.SqliteErrorCode == 19) { throw new ArgumentException("密钥名称已存在。"); }
+        Audit("web", "-", "key.create", "success"); return new { id, name };
+    }
+    public void DeleteSharedKey(string id)
+    {
+        using var c = Open(); using var cmd = c.CreateCommand(); cmd.CommandText = "DELETE FROM shared_keys WHERE id=$id"; cmd.Parameters.AddWithValue("$id", id);
+        if (cmd.ExecuteNonQuery() == 0) throw new ArgumentException("找不到指定的共享私钥。"); Audit("web", "-", "key.delete", "success");
     }
     private string Encrypt(Credential value)
     {

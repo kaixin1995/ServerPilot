@@ -153,6 +153,9 @@ api.MapDelete("/servers/{id}", (string id, ServerStore store) => Safe(() => { st
 api.MapPost("/servers/{id}/test", async (string id, SshOperations ssh) => await SafeAsync(async () => Results.Ok(await ssh.Test(id, "web"))));
 api.MapPost("/servers/{id}/execute", async (string id, CommandInput input, SshOperations ssh, CancellationToken ct) => await SafeAsync(async () => Results.Ok(await ssh.Execute(id, input.Command, input.TimeoutSeconds, "web", ct))));
 api.MapGet("/audit", (ServerStore store, int page = 1, int pageSize = 50) => Safe(() => Results.Ok(store.AuditList(page, pageSize))));
+api.MapGet("/keys", (ServerStore store) => Results.Ok(store.ListSharedKeys()));
+api.MapPost("/keys", (SharedKeyInput input, ServerStore store) => Safe(() => Results.Ok(store.AddSharedKey(input))));
+api.MapDelete("/keys/{id}", (string id, ServerStore store) => Safe(() => { store.DeleteSharedKey(id); return Results.Ok(); }));
 api.MapGet("/files", (SshOperations ssh) => Results.Ok(ssh.ListStaging()));
 api.MapPost("/files", async (HttpRequest req, SshOperations ssh, CancellationToken ct) => await SafeAsync(async () =>
 {
