@@ -36,9 +36,11 @@ public sealed class ServerStore(AppOptions options)
             CREATE TABLE IF NOT EXISTS audit(
                 id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, actor TEXT NOT NULL,
                 server_name TEXT NOT NULL, action TEXT NOT NULL, result TEXT NOT NULL);
+            CREATE INDEX IF NOT EXISTS audit_at_idx ON audit(at);
             """;
         cmd.ExecuteNonQuery();
         EnsureColumns(c);
+        CleanupAudit();
         if (!OperatingSystem.IsWindows()) File.SetUnixFileMode(Path.Combine(options.DataDirectory, "serverpilot.db"), UnixFileMode.UserRead | UnixFileMode.UserWrite);
     }
     private static void EnsureColumns(SqliteConnection c)
@@ -127,10 +129,22 @@ public sealed class ServerStore(AppOptions options)
         cmd.Parameters.AddWithValue("$at", DateTimeOffset.UtcNow.ToString("O")); cmd.Parameters.AddWithValue("$actor", actor); cmd.Parameters.AddWithValue("$server", server);
         cmd.Parameters.AddWithValue("$action", action); cmd.Parameters.AddWithValue("$result", result); cmd.ExecuteNonQuery();
     }
-    public List<object> AuditList()
+    public void CleanupAudit()
     {
-        using var c = Open(); using var cmd = c.CreateCommand(); cmd.CommandText = "SELECT at,actor,server_name,action,result FROM audit ORDER BY id DESC LIMIT 200";
-        using var r = cmd.ExecuteReader(); var rows = new List<object>(); while (r.Read()) rows.Add(new { at=r.GetString(0), actor=r.GetString(1), server=r.GetString(2), action=r.GetString(3), result=r.GetString(4) }); return rows;
+        using var c = Open(); using var cmd = c.CreateCommand(); cmd.CommandText = "DELETE FROM audit WHERE at < $cutoff";
+        cmd.Parameters.AddWithValue("$cutoff", DateTimeOffset.UtcNow.AddDays(-30).ToString("O")); cmd.ExecuteNonQuery();
+    }
+    public object AuditList(int page, int pageSize)
+    {
+        if (page < 1 || pageSize is < 1 or > 100) throw new ArgumentException("页码无效，每页数量应在 1–100 之间。");
+        CleanupAudit();
+        using var c = Open(); using var transaction = c.BeginTransaction();
+        using var count = c.CreateCommand(); count.Transaction = transaction; count.CommandText = "SELECT COUNT(*) FROM audit";
+        var total = (long)count.ExecuteScalar()!; var totalPages = Math.Max(1, (total + pageSize - 1) / pageSize); page = (int)Math.Min(page, totalPages);
+        using var cmd = c.CreateCommand(); cmd.Transaction = transaction; cmd.CommandText = "SELECT at,actor,server_name,action,result FROM audit ORDER BY id DESC LIMIT $limit OFFSET $offset";
+        cmd.Parameters.AddWithValue("$limit", pageSize); cmd.Parameters.AddWithValue("$offset", ((long)page - 1) * pageSize);
+        using var r = cmd.ExecuteReader(); var rows = new List<object>(); while (r.Read()) rows.Add(new { at=r.GetString(0), actor=r.GetString(1), server=r.GetString(2), action=r.GetString(3), result=r.GetString(4) });
+        return new { items = rows, page, pageSize, total, totalPages };
     }
     private string Encrypt(Credential value)
     {

@@ -49,6 +49,7 @@ using (var keyCheck = new FileStream(keyCheckPath, FileMode.OpenOrCreate, FileAc
 builder.Services.AddSingleton(options);
 builder.Services.AddSingleton<AdminPasswordStore>();
 builder.Services.AddSingleton<ServerStore>();
+builder.Services.AddHostedService<AuditCleanupService>();
 builder.Services.AddSingleton<SshOperations>();
 builder.Services.AddSingleton<JobService>();
 builder.Services.Configure<ForwardedHeadersOptions>(o =>
@@ -151,7 +152,7 @@ api.MapPut("/servers/{id}", (string id, ServerInput input, ServerStore store) =>
 api.MapDelete("/servers/{id}", (string id, ServerStore store) => Safe(() => { store.Delete(id); return Results.Ok(); }));
 api.MapPost("/servers/{id}/test", async (string id, SshOperations ssh) => await SafeAsync(async () => Results.Ok(await ssh.Test(id, "web"))));
 api.MapPost("/servers/{id}/execute", async (string id, CommandInput input, SshOperations ssh, CancellationToken ct) => await SafeAsync(async () => Results.Ok(await ssh.Execute(id, input.Command, input.TimeoutSeconds, "web", ct))));
-api.MapGet("/audit", (ServerStore store) => Results.Ok(store.AuditList()));
+api.MapGet("/audit", (ServerStore store, int page = 1, int pageSize = 50) => Safe(() => Results.Ok(store.AuditList(page, pageSize))));
 api.MapGet("/files", (SshOperations ssh) => Results.Ok(ssh.ListStaging()));
 api.MapPost("/files", async (HttpRequest req, SshOperations ssh, CancellationToken ct) => await SafeAsync(async () =>
 {
@@ -195,6 +196,18 @@ record WriteFileInput(string RemotePath, string Content, bool Append = false, in
 
 namespace ServerPilot
 {
+    public sealed class AuditCleanupService(ServerStore store, ILogger<AuditCleanupService> logger) : BackgroundService
+    {
+        protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+        {
+            using var timer = new PeriodicTimer(TimeSpan.FromHours(1));
+            while (await timer.WaitForNextTickAsync(stoppingToken))
+            {
+                try { store.CleanupAudit(); }
+                catch (Exception error) { logger.LogError(error, "清理过期操作记录失败。"); }
+            }
+        }
+    }
     public sealed class AdminPasswordStore
     {
         private readonly string path;

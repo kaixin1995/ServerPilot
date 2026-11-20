@@ -113,3 +113,5 @@ header { background: transparent; border: 0; height: 64px; }
   .metrics { grid-template-columns: repeat(auto-fit,minmax(min(220px,100%),1fr)); }
 }
 .security-panel { max-width: 600px; }
+.audit-pagination { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:16px 26px; color:#738194; font-size:12px; }
+.audit-pagination > div { display:flex; gap:8px; flex-wrap:wrap; }
