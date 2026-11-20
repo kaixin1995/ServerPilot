@@ -41,7 +41,7 @@ tbody tr:hover { background: #fafcfe; }
 .badge { background: #f3f5f8; color: #6b7a8e; }
 .badge.key { background: #f0f7f3; }
 .link-button { color: #5277a2; }
-.link-button.muted { color: #738194; }
+.link-button.secondary-action { color: #738194; }
 .link-button.danger { color: #ad6d73; }
 .empty, .field-title, label { color: #53657b; }
 .hint { background: #f2f6fc; border-color: #e7eef7; color: #5e7a9e; }
@@ -113,6 +113,8 @@ header { background: transparent; border: 0; height: 64px; }
   .metrics { grid-template-columns: repeat(auto-fit,minmax(min(220px,100%),1fr)); }
 }
 .security-panel { max-width: 600px; }
+.toolbar input { margin-top: 0; }
+.inline-actions > label { margin-bottom: 0; }
 .audit-pagination { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:16px 26px; color:#738194; font-size:12px; }
 .audit-pagination > div, .shared-key-actions { display:flex; gap:8px; flex-wrap:wrap; }
 .shared-key-manager { padding:14px; margin-bottom:16px; border:1px solid var(--line); border-radius:10px; }
