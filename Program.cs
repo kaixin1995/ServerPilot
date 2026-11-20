@@ -11,8 +11,8 @@ using ModelContextProtocol.AspNetCore;
 using ServerPilot;
 
 var builder = WebApplication.CreateBuilder(args);
-builder.WebHost.ConfigureKestrel(o => o.Limits.MaxRequestBodySize = 129L * 1024 * 1024);
-builder.Services.Configure<FormOptions>(o => o.MultipartBodyLengthLimit = 129L * 1024 * 1024);
+builder.WebHost.ConfigureKestrel(o => o.Limits.MaxRequestBodySize = 513L * 1024 * 1024);
+builder.Services.Configure<FormOptions>(o => o.MultipartBodyLengthLimit = 513L * 1024 * 1024);
 if (string.IsNullOrWhiteSpace(builder.Configuration["ASPNETCORE_URLS"]))
     builder.WebHost.UseUrls("http://127.0.0.1:5080");
 var options = AppOptions.Load(builder.Configuration, builder.Environment.ContentRootPath);

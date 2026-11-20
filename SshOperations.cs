@@ -12,7 +12,7 @@ public sealed record TextReadResult(string Content, long Size, long Offset, long
 
 public sealed class SshOperations(ServerStore store, AppOptions options, ILogger<SshOperations> logger)
 {
-    private const long MaxFileBytes = 128L * 1024 * 1024;
+    private const long MaxFileBytes = 512L * 1024 * 1024;
     private const int MaxOutputBytes = 512 * 1024;
     private const int MaxReadBytes = 1024 * 1024;
 
@@ -182,7 +182,7 @@ public sealed class SshOperations(ServerStore store, AppOptions options, ILogger
     public List<object> ListStaging() => Directory.EnumerateFiles(options.StagingDirectory).Select(p => new FileInfo(p)).Where(f => !f.Attributes.HasFlag(FileAttributes.ReparsePoint)).OrderBy(f => f.Name).Select(f => (object)new { name = f.Name, size = f.Length, updatedAt = f.LastWriteTimeUtc }).ToList();
     public async Task<object> StageFile(string name, Stream input, long length, CancellationToken ct)
     {
-        if (length < 0 || length > MaxFileBytes) throw new ArgumentException("文件不能超过 128 MiB。");
+        if (length < 0 || length > MaxFileBytes) throw new ArgumentException("文件不能超过 512 MiB。");
         var path = StagingPath(name); if (File.Exists(path)) throw new ArgumentException("文件已存在，请换一个名称。");
         var created = false;
         try
@@ -191,7 +191,7 @@ public sealed class SshOperations(ServerStore store, AppOptions options, ILogger
             created = true;
             if (!OperatingSystem.IsWindows()) File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite);
             await input.CopyToAsync(output, ct);
-            if (output.Length > MaxFileBytes) throw new ArgumentException("文件不能超过 128 MiB。");
+            if (output.Length > MaxFileBytes) throw new ArgumentException("文件不能超过 512 MiB。");
             store.Audit("web", "-", "staging.upload", "success"); return new { name, size = output.Length };
         }
         catch { if (created && File.Exists(path)) File.Delete(path); throw; }
@@ -208,7 +208,7 @@ public sealed class SshOperations(ServerStore store, AppOptions options, ILogger
         RemotePath(remotePath);
         return Logged<object>(id, actor, "sftp.upload", s => Task.Run<object>(() =>
         {
-            using var input = OpenStaged(stagingFile); if (input.Length > MaxFileBytes) throw new ArgumentException("文件不能超过 128 MiB。");
+            using var input = OpenStaged(stagingFile); if (input.Length > MaxFileBytes) throw new ArgumentException("文件不能超过 512 MiB。");
             using var sftp = ConnectSftp(s); AllowedRemotePath(sftp, s.View, remotePath); if (!overwrite && sftp.Exists(remotePath)) throw new ArgumentException("远程文件已存在；如需覆盖，请明确指定。");
             sftp.UploadFile(input, remotePath, overwrite); return new { uploaded = true, stagingFile, remotePath, bytes = input.Length };
         }));
@@ -219,7 +219,7 @@ public sealed class SshOperations(ServerStore store, AppOptions options, ILogger
         return Logged<object>(id, actor, "sftp.download", s => Task.Run<object>(() =>
         {
             using var sftp = ConnectSftp(s); AllowedRemotePath(sftp, s.View, remotePath); var attr = sftp.GetAttributes(remotePath);
-            if (!attr.IsRegularFile || attr.Size > MaxFileBytes) throw new ArgumentException("仅支持下载不超过 128 MiB 的普通文件。");
+            if (!attr.IsRegularFile || attr.Size > MaxFileBytes) throw new ArgumentException("仅支持下载不超过 512 MiB 的普通文件。");
             if (File.Exists(local)) throw new ArgumentException("暂存区文件已存在，请换一个名称。");
             var created = false;
             try

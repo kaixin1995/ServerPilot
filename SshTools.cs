@@ -35,11 +35,11 @@ public sealed class SshTools
     [McpServerTool(Name = "list_staged_files", ReadOnly = true), Description("List files in the server-side staging area; these files are on the MCP host, not the AI client's computer.")]
     public static object ListStagedFiles(SshOperations ssh) => ssh.ListStaging();
 
-    [McpServerTool(Name = "upload_file"), Description("Upload one existing file from the MCP host's staging area to an absolute remote Linux path. Files up to 128 MiB. Does not overwrite by default.")]
+    [McpServerTool(Name = "upload_file"), Description("Upload one existing file from the MCP host's staging area to an absolute remote Linux path. Files up to 512 MiB. Does not overwrite by default.")]
     public static Task<object> UploadFile(SshOperations ssh, string server, [Description("Plain filename in staging, without any directory")] string stagingFile, [Description("Absolute destination path on the SSH server")] string remotePath, [Description("Set true to explicitly permit overwriting the remote file")] bool overwrite = false)
         => Guard(() => ssh.Upload(server, stagingFile, remotePath, "mcp", overwrite));
 
-    [McpServerTool(Name = "download_file"), Description("Download a remote file into the MCP host's staging area. Existing staging files are never overwritten. Files up to 128 MiB.")]
+    [McpServerTool(Name = "download_file"), Description("Download a remote file into the MCP host's staging area. Existing staging files are never overwritten. Files up to 512 MiB.")]
     public static Task<object> DownloadFile(SshOperations ssh, string server, [Description("Absolute path on the SSH server")] string remotePath, [Description("New plain filename in staging")] string stagingFile)
         => Guard(() => ssh.Download(server, remotePath, stagingFile, "mcp"));
 
