@@ -112,7 +112,4 @@ header { background: transparent; border: 0; height: 64px; }
   .brand { padding-bottom: 18px; margin-bottom: 16px; }
   .metrics { grid-template-columns: repeat(auto-fit,minmax(min(220px,100%),1fr)); }
 }
-.security-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }
-.security-panel, .token-panel { min-height: 390px; }
-.token-value { margin: 24px 0 16px; padding: 14px; border: 1px solid #dce6f4; border-radius: 10px; background: #f5f8fd; color: #456b9d; font: 12px/1.6 Consolas, monospace; overflow-wrap: anywhere; }
-@media(max-width:800px) { .security-grid { grid-template-columns: 1fr; } }
+.security-panel { max-width: 600px; }

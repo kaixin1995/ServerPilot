@@ -9,7 +9,7 @@
 - 网页后台：管理员登录；添加、编辑、删除、搜索服务器；候选主机指纹获取；连接测试；执行命令；文件暂存、上传下载；最近 200 条操作记录。
 - 服务器认证：SSH 密码或私钥（可带口令），可选 SSH 密钥文件、键盘交互式 2FA/MFA 和 SOCKS/HTTP 代理；每台必须固定 SHA-256 主机指纹，每次连接都会校验。凭据 AES-256-GCM 加密后存 SQLite，网页列表、API 列表和 MCP 列表不返回凭据。
 - MCP：Streamable HTTP `/mcp`；`list_servers`、`test_connection`、`execute_command`、`start_job`、`job_status`、`job_kill`、`job_list`、`read_file`、`write_file`、`list_staged_files`、`upload_file`、`download_file`。
-- 默认仅监听 `127.0.0.1:5080`。后台密码和 MCP Bearer 令牌分别设置。
+- 默认仅监听 `127.0.0.1:5080`。MCP Bearer 令牌始终使用当前后台登录密码。
 
 命令不做白名单限制；AI 可以按 SSH 用户权限管理远端服务器。每台服务器可设置 SFTP 允许路径；该限制不约束 SSH 命令，且不能防止远端用户并发替换路径，因此不能作为隔离边界。MCP 令牌持有者拥有相应操作能力，必须像密码一样保护。
 
@@ -24,11 +24,10 @@ openssl version
 
 如果尚未安装 .NET SDK，请按照 [微软 .NET 8 安装说明](https://learn.microsoft.com/dotnet/core/install/linux)选择你的发行版安装。项目的 NuGet 包在首次构建时需要从 NuGet 下载。
 
-进入项目目录，准备三个**互不相同**的密钥。下面命令会在终端中显示新生成的值，请自己复制并安全保存，不要粘贴到 AI 对话中：
+进入项目目录，准备管理员密码和独立的数据加密密钥。下面命令会在终端中显示新生成的值，请自己复制并安全保存，不要粘贴到 AI 对话中：
 
 ```bash
 openssl rand -base64 32   # 管理员密码
-openssl rand -base64 32   # MCP 令牌
 openssl rand -base64 32   # 数据加密密钥（必须正好 32 随机字节的 Base64）
 ```
 
@@ -36,16 +35,17 @@ openssl rand -base64 32   # 数据加密密钥（必须正好 32 随机字节的
 
 ```bash
 read -rsp '管理员密码：' SERVERPILOT_ADMIN_PASSWORD; echo
-read -rsp 'MCP 令牌：' SERVERPILOT_MCP_TOKEN; echo
 read -rsp '数据加密密钥：' SERVERPILOT_ENCRYPTION_KEY; echo
-export SERVERPILOT_ADMIN_PASSWORD SERVERPILOT_MCP_TOKEN SERVERPILOT_ENCRYPTION_KEY
+export SERVERPILOT_ADMIN_PASSWORD SERVERPILOT_ENCRYPTION_KEY
 export SERVERPILOT_DATA_DIR="$PWD/data"
 
 dotnet restore
 dotnet run --no-launch-profile
 ```
 
-要求：管理员密码至少 8 字符，MCP 令牌至少 32 字符；加密密钥必须解码为 32 字节。**保存好加密密钥**：数据库只有和原来的密钥一起才能解密。程序会在数据目录保存密钥校验文件，启动时检查密钥是否匹配；不要删除该文件。
+要求：管理员密码为 8–1024 个非空白 ASCII 字符；加密密钥必须解码为 32 字节。**保存好加密密钥**：数据库只有和原来的密钥一起才能解密。程序会在数据目录保存密钥校验文件，启动时检查密钥是否匹配；不要删除该文件。
+
+MCP Bearer 令牌始终是当前管理员密码；更改管理员密码会立即使旧令牌失效，必须更新所有 MCP 客户端。共用凭据降低安全隔离，建议仅在可信环境使用强密码。已有部署的独立 `SERVERPILOT_MCP_TOKEN` 将不再生效，升级后请将客户端令牌改为当前管理员密码。
 
 可选的环境变量：
 
@@ -118,10 +118,10 @@ url = "http://127.0.0.1:5080/mcp"
 bearer_token_env_var = "SERVERPILOT_MCP_TOKEN"
 ```
 
-在启动 Codex 的进程环境中注入同一 MCP 令牌：
+在启动 Codex 的进程环境中注入当前管理员密码作为 MCP 令牌：
 
 ```bash
-read -rsp 'MCP 令牌：' SERVERPILOT_MCP_TOKEN; echo
+read -rsp '管理员密码：' SERVERPILOT_MCP_TOKEN; echo
 export SERVERPILOT_MCP_TOKEN
 codex
 ```
@@ -133,7 +133,7 @@ codex
 Claude Code 可连接 HTTP MCP。以下使用交互式输入，避免令牌进入 shell 历史：
 
 ```bash
-read -rsp 'MCP 令牌：' SP_CLIENT_TOKEN; echo
+read -rsp '管理员密码：' SP_CLIENT_TOKEN; echo
 claude mcp add --transport http serverpilot http://127.0.0.1:5080/mcp \
   --header "Authorization: Bearer $SP_CLIENT_TOKEN"
 unset SP_CLIENT_TOKEN
@@ -172,7 +172,6 @@ sudo install -d -m 700 /etc/serverpilot
 
 ```ini
 SERVERPILOT_ADMIN_PASSWORD=替换为管理员密码
-SERVERPILOT_MCP_TOKEN=替换为MCP令牌
 SERVERPILOT_ENCRYPTION_KEY=替换为32字节Base64加密密钥
 SERVERPILOT_DATA_DIR=/var/lib/serverpilot
 # 可选：服务端统一 SSH 密钥文件
@@ -222,11 +221,11 @@ sudo systemctl status serverpilot
 sudo journalctl -u serverpilot -f
 ```
 
-这里的环境文件是 root 可读的明文配置。环境变量也不是强隔离密钥库；请限制主机 root、进程调试和文件访问权限。不要把 `/etc/serverpilot/serverpilot.env`、数据库或数据目录提交 Git。管理员密码和令牌由环境变量直接校验，不是可管理多用户的身份系统。
+这里的环境文件是 root 可读的明文配置。环境变量也不是强隔离密钥库；请限制主机 root、进程调试和文件访问权限。不要把 `/etc/serverpilot/serverpilot.env`、数据库或数据目录提交 Git。初始密码来自环境变量；首次启动后密码以加盐哈希保存在数据目录中，不是可管理多用户的身份系统。
 
 ## 七、备份和恢复
 
-停止服务后，备份整个数据目录（包括 `.keycheck`、SQLite 数据库、`cookie-keys/` 和需要保留的 `staging/`）。**加密密钥需要单独安全备份**；不要和数据库一起放在公开位置。恢复时使用原来的数据加密密钥和完整数据目录，再启动服务。管理员密码和 MCP 令牌可以分别更换；更换后需要更新客户端配置，且原有网页会话不会自动立即失效，必要时删除或轮换 Cookie 密钥并重启。
+停止服务后，备份整个数据目录（包括 `.keycheck`、`admin-password.json`、SQLite 数据库、`cookie-keys/` 和需要保留的 `staging/`）。**加密密钥需要单独安全备份**；不要和数据库一起放在公开位置。恢复时使用原来的数据加密密钥和完整数据目录，再启动服务。修改管理员密码后旧网页会话和旧 MCP 凭据失效，需要更新客户端配置。
 
 ## 八、当前边界
 

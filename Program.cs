@@ -102,7 +102,8 @@ app.Use(async (ctx, next) =>
     if (ctx.Request.Path.StartsWithSegments("/mcp"))
     {
         var auth = ctx.Request.Headers.Authorization.ToString();
-        if (!auth.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase) || !Secrets.Equal(auth[7..], options.McpToken))
+        if (!auth.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase) ||
+            !ctx.RequestServices.GetRequiredService<AdminPasswordStore>().Verify(auth[7..]))
         { ctx.Response.StatusCode = 401; ctx.Response.Headers.WWWAuthenticate = "Bearer"; return; }
     }
     else if (ctx.Request.Path.StartsWithSegments("/api") && !HttpMethods.IsGet(ctx.Request.Method))
@@ -134,7 +135,7 @@ api.MapPost("/password", async (PasswordChangeInput input, AdminPasswordStore pa
 {
     if (string.IsNullOrWhiteSpace(input.NewPassword) || input.NewPassword.Length is < 8 or > 1024) return Results.BadRequest(new { error = "新密码需要 8–1024 个字符，不能全为空格。" });
     if (!Secrets.Equal(input.NewPassword, input.ConfirmPassword ?? "")) return Results.BadRequest(new { error = "两次输入的新密码不一致。" });
-    if (Secrets.Equal(input.NewPassword, options.McpToken)) return Results.BadRequest(new { error = "管理员密码不能与 MCP 令牌相同。" });
+    if (input.NewPassword.Any(character => character < '!' || character > '~')) return Results.BadRequest(new { error = "密码只能包含非空白的 ASCII 字符。" });
     try
     {
         if (!passwords.Change(input.CurrentPassword ?? "", input.NewPassword)) return Results.BadRequest(new { error = "当前密码不正确。" });
@@ -143,11 +144,6 @@ api.MapPost("/password", async (PasswordChangeInput input, AdminPasswordStore pa
     catch (UnauthorizedAccessException) { return Results.Problem("密码保存失败，请检查数据目录权限。", statusCode: 500); }
     await ctx.SignOutAsync();
     return Results.Ok(new { changed = true });
-}).RequireRateLimiting("login");
-api.MapPost("/mcp-token/reveal", (TokenRevealInput input, AdminPasswordStore passwords, AppOptions options) =>
-{
-    if (!passwords.Verify(input.Password ?? "")) return Results.BadRequest(new { error = "管理员密码不正确。" });
-    return Results.Ok(new { token = options.McpToken });
 }).RequireRateLimiting("login");
 api.MapPost("/servers/probe", async (ProbeInput input, SshOperations ssh) => await SafeAsync(async () => Results.Ok(await ssh.Probe(input.Host, input.Port))));
 api.MapPost("/servers", (ServerInput input, ServerStore store) => Safe(() => Results.Ok(store.Save(null, input))));
@@ -190,7 +186,6 @@ static async Task<IResult> SafeAsync(Func<Task<IResult>> action)
 }
 record LoginInput(string? Password);
 record PasswordChangeInput(string? CurrentPassword, string? NewPassword, string? ConfirmPassword);
-record TokenRevealInput(string? Password);
 record CommandInput(string Command, int TimeoutSeconds = 60);
 record TransferInput(string StagingFile, string RemotePath);
 record ProbeInput(string Host, int Port);
@@ -252,16 +247,15 @@ namespace ServerPilot
         private sealed record PasswordFile(string Salt, string Hash);
     }
 
-    public sealed record AppOptions(string DataDirectory, string StagingDirectory, string AdminPassword, string McpToken, byte[] EncryptionKey, string[] AllowedHosts,
+    public sealed record AppOptions(string DataDirectory, string StagingDirectory, string AdminPassword, byte[] EncryptionKey, string[] AllowedHosts,
         string? TwoFactorCode, string? ServiceKeyPath, string? ServiceKeyPassphrase)
     {
         public static AppOptions Load(IConfiguration c, string root)
         {
             var admin = c["SERVERPILOT_ADMIN_PASSWORD"] ?? "";
-            var token = c["SERVERPILOT_MCP_TOKEN"] ?? "";
             var key = c["SERVERPILOT_ENCRYPTION_KEY"] ?? "";
-            if (admin.Length < 8 || token.Length < 32 || Secrets.Equal(admin, token))
-                throw new InvalidOperationException("Set distinct SERVERPILOT_ADMIN_PASSWORD (at least 8 characters) and SERVERPILOT_MCP_TOKEN (at least 32 characters).");
+            if (admin.Length < 8 || admin.Length > 1024 || admin.Any(character => character < '!' || character > '~'))
+                throw new InvalidOperationException("Set SERVERPILOT_ADMIN_PASSWORD to 8–1024 non-whitespace ASCII characters.");
             byte[] bytes;
             try { bytes = Convert.FromBase64String(key); } catch { throw new InvalidOperationException("SERVERPILOT_ENCRYPTION_KEY must be base64 for 32 random bytes."); }
             if (bytes.Length != 32) throw new InvalidOperationException("SERVERPILOT_ENCRYPTION_KEY must be base64 for 32 random bytes.");
@@ -275,7 +269,7 @@ namespace ServerPilot
             var servicePassphrase = c["SERVERPILOT_SERVICE_KEY_PASSPHRASE"];
             if (!string.IsNullOrEmpty(servicePassphrase) && servicePassphrase.Length > 4096)
                 throw new InvalidOperationException("SERVERPILOT_SERVICE_KEY_PASSPHRASE 过长。");
-            return new(dir, Path.Combine(dir, "staging"), admin, token, bytes, hosts, string.IsNullOrWhiteSpace(twoFactor) ? null : twoFactor.Trim(),
+            return new(dir, Path.Combine(dir, "staging"), admin, bytes, hosts, string.IsNullOrWhiteSpace(twoFactor) ? null : twoFactor.Trim(),
                 string.IsNullOrWhiteSpace(serviceKey) ? null : Path.GetFullPath(serviceKey), string.IsNullOrEmpty(servicePassphrase) ? null : servicePassphrase);
         }
     }
