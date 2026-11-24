@@ -12,3 +12,5 @@ node_modules/
 !.env.example
 admin-password.json
 admin-password.json.tmp
+.encryption-key
+.encryption-key.tmp
