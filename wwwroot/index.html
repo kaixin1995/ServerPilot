@@ -52,6 +52,7 @@
       <div class="nav-label">基础设施</div>
       <nav>
         <button class="nav-item active" data-view="servers"><span></span>服务器 <b id="nav-count">0</b></button>
+        <button class="nav-item" data-view="keys"><span></span>SSH 密钥 <b id="nav-keys-count">0</b></button>
         <button class="nav-item" data-view="batch"><span></span>命令与批量</button>
         <button class="nav-item" data-view="files"><span></span>文件暂存</button>
       </nav>
@@ -158,6 +159,80 @@
         <div>
           <strong>凭据安全留在服务端</strong>
           <p>SSH 密码、私钥与代理凭据均经 AES-256-GCM 加密落库；服务器列表与 MCP 工具绝不回传凭据原文。</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- VIEW: SSH Keys Management -->
+    <section id="view-keys" class="page hidden">
+      <div class="page-heading">
+        <div>
+          <div class="eyebrow">SSH KEY VAULT</div>
+          <h1>SSH 密钥管理</h1>
+          <p>集中维护多台主机共用的 SSH 私钥；采用引用绑定，轮换密钥后所有关联服务器即时生效。</p>
+        </div>
+        <div class="page-actions">
+          <button id="open-import-key" class="button secondary">＋ 导入已有私钥</button>
+          <button id="open-generate-key" class="button primary">＋ 生成新密钥对</button>
+        </div>
+      </div>
+
+      <div id="new-key-banner" class="token-banner hidden">
+        <strong id="new-key-banner-title">密钥已就绪（公钥可直接复制或一键下发到目标服务器）</strong>
+        <div class="copyline">
+          <code id="new-key-pub" style="font-size:12px"></code>
+          <div class="toolbar" style="flex:none">
+            <button type="button" id="copy-new-key-pub" class="button primary sm">复制公钥</button>
+            <button type="button" id="deploy-new-key-btn" class="button secondary sm">下发到服务器</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="metrics three">
+        <div class="metric">
+          <small>01 / 密钥总数</small>
+          <strong id="metric-keys-total">0</strong>
+          <p>AES-256-GCM 加密存库，绝不回传私钥原文</p>
+        </div>
+        <div class="metric">
+          <small>02 / 已绑定主机</small>
+          <strong id="metric-keys-bound" class="ok">0</strong>
+          <p>正在引用共享密钥的服务器数量</p>
+        </div>
+        <div class="metric">
+          <small>03 / 集中轮换</small>
+          <strong>自动同步</strong>
+          <p>更新密钥或口令后所有绑定主机即时生效</p>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-heading">
+          <div>
+            <h2>密钥库列表</h2>
+            <p>支持查看指纹、一键复制公钥、批量下发至远端 authorized_keys 与安全轮换</p>
+          </div>
+          <div class="toolbar">
+            <input id="key-search" class="search" placeholder="搜索密钥名称、指纹或备注">
+            <button id="refresh-keys" class="icon-button" title="刷新密钥列表"></button>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>密钥名称</th><th>算法与指纹</th><th>已绑定主机</th><th>更新时间</th><th></th></tr>
+            </thead>
+            <tbody id="key-rows"></tbody>
+          </table>
+          <div id="empty-keys" class="empty hidden">
+            <div class="empty-icon"></div>
+            <strong>还没有共享 SSH 密钥</strong>
+            <p>在线生成一把 Ed25519 密钥对，或导入已有私钥文件供多台服务器共用。</p>
+            <div class="toolbar" style="justify-content:center">
+              <button id="empty-gen-key" class="button primary">＋ 生成新密钥对</button>
+              <button id="empty-imp-key" class="button secondary">＋ 导入已有私钥</button>
+            </div>
+          </div>
         </div>
       </div>
     </section>
@@ -498,22 +573,17 @@
     </div>
 
     <div id="key-fields">
-      <label>选择共享私钥
-        <small>保存服务器时会复制加密私钥；之后删除共享私钥不会影响已保存的服务器。</small>
-        <select id="shared-key-select" name="sharedKeyId"><option value="">不使用共享私钥（可手动填写或沿用原私钥）</option></select>
-      </label>
-      <details class="shared-key-manager">
-        <summary>上传和管理共享私钥</summary>
-        <label>密钥名称<input id="shared-key-name" maxlength="80" placeholder="例如 运维密钥"></label>
-        <label>私钥文件<input id="shared-key-file" type="file"></label>
-        <label>私钥口令 <small>如有</small><input id="shared-key-passphrase" type="password" autocomplete="new-password"></label>
-        <div class="shared-key-actions">
-          <button type="button" id="save-shared-key" class="button secondary sm">上传并保存</button>
-          <button type="button" id="delete-shared-key" class="button secondary sm">删除选中密钥</button>
+      <label>选择共享密钥（引用绑定，推荐）
+        <small>选择密钥库中的密钥后，服务器会引用该密钥；后续在“SSH 密钥”页更新/轮换私钥时，本主机将自动生效。</small>
+        <div class="toolbar" style="margin-top:6px">
+          <select id="shared-key-select" name="sharedKeyId" style="flex:1;margin:0"><option value="">不使用密钥库（手动填写本机专用私钥）</option></select>
+          <button type="button" id="goto-keys-page" class="button secondary sm">管理密钥 →</button>
         </div>
-      </details>
-      <label>SSH 私钥 <em class="new-required">*</em><textarea name="privateKey" rows="3" autocomplete="off" placeholder="粘贴私钥内容，仅在服务器端加密保存"></textarea></label>
-      <label>私钥口令 <small>如有</small><input name="passphrase" type="password" autocomplete="new-password" placeholder="私钥未加密可留空"></label>
+      </label>
+      <div id="manual-key-fields">
+        <label>SSH 私钥 <em class="new-required">*</em><textarea name="privateKey" rows="3" autocomplete="off" placeholder="粘贴私钥内容，仅在服务器端加密保存"></textarea></label>
+        <label>私钥口令 <small>如有</small><input name="passphrase" type="password" autocomplete="new-password" placeholder="私钥未加密可留空"></label>
+      </div>
     </div>
 
     <div id="password-fields" class="hidden">
@@ -790,6 +860,86 @@
     </div>
     <div class="dialog-footer">
       <button type="button" class="button secondary" data-close="import-dialog">关闭</button>
+    </div>
+  </form>
+</dialog>
+
+<!-- DIALOG: Generate SSH Key Pair -->
+<dialog id="key-generate-dialog">
+  <form id="key-generate-form">
+    <div class="dialog-header">
+      <div><div class="eyebrow">KEY GENERATOR</div><h2>在线生成 SSH 密钥对</h2><p>在服务端直接生成标准 OpenSSH 密钥对并加密存储私钥。</p></div>
+      <button type="button" class="close" data-close="key-generate-dialog"></button>
+    </div>
+    <div class="form-grid">
+      <label>密钥名称 <em>*</em><input name="name" required maxlength="80" placeholder="例如 生产运维主密钥"></label>
+      <label>密钥算法
+        <select name="algorithm">
+          <option value="ed25519">Ed25519（推荐，现代高速安全）</option>
+          <option value="rsa4096">RSA-4096（兼容老旧系统）</option>
+        </select>
+      </label>
+    </div>
+    <label>备注<input name="notes" maxlength="500" placeholder="例如 适用于测试与生产机群"></label>
+    <p id="key-gen-error" class="error"></p>
+    <div class="dialog-footer">
+      <button type="button" class="button secondary" data-close="key-generate-dialog">取消</button>
+      <button type="submit" class="button primary">立即生成</button>
+    </div>
+  </form>
+</dialog>
+
+<!-- DIALOG: Import / Edit / Rotate SSH Key -->
+<dialog id="key-edit-dialog">
+  <form id="key-edit-form">
+    <div class="dialog-header">
+      <div><div class="eyebrow">SSH KEY</div><h2 id="key-edit-title">导入已有私钥</h2><p id="key-edit-desc">上传私钥文件或粘贴私钥内容，服务端将自动提取算法、公钥与 SHA-256 指纹。</p></div>
+      <button type="button" class="close" data-close="key-edit-dialog"></button>
+    </div>
+    <input type="hidden" name="id">
+    <label>密钥名称 <em>*</em><input name="name" required maxlength="80" placeholder="例如 ops-ed25519"></label>
+    <label>选择本地私钥文件（可选，选中后自动填入下方）<input id="key-edit-file" type="file"></label>
+    <label>私钥内容 <em id="key-edit-req">*</em>
+      <textarea name="privateKey" rows="5" class="mono" autocomplete="off" placeholder="粘贴 -----BEGIN OPENSSH PRIVATE KEY----- 或 PEM 私钥内容"></textarea>
+    </label>
+    <label>私钥口令 <small>私钥未加密可留空</small><input name="passphrase" type="password" autocomplete="new-password" placeholder="如有口令请填写"></label>
+    <label>备注<input name="notes" maxlength="500" placeholder="可选"></label>
+    <p id="key-edit-error" class="error"></p>
+    <div class="dialog-footer">
+      <button type="button" class="button secondary" data-close="key-edit-dialog">取消</button>
+      <button type="submit" class="button primary">保存密钥</button>
+    </div>
+  </form>
+</dialog>
+
+<!-- DIALOG: Deploy Public Key to Servers -->
+<dialog id="key-deploy-dialog">
+  <form id="key-deploy-form">
+    <div class="dialog-header">
+      <div><div class="eyebrow">PUBLIC KEY DEPLOY</div><h2>一键下发公钥</h2><p id="key-deploy-subtitle"></p></div>
+      <button type="button" class="close" data-close="key-deploy-dialog"></button>
+    </div>
+    <input type="hidden" id="deploy-key-id">
+    <div class="field-title" style="margin-top:0">公钥预览</div>
+    <div class="copyline" style="margin-bottom:14px">
+      <code id="deploy-key-pub" style="font-size:11.5px;max-height:54px;overflow:auto"></code>
+      <button type="button" id="copy-deploy-pub" class="button secondary sm">复制</button>
+    </div>
+    <div class="field-title">选择要写入 ~/.ssh/authorized_keys 的目标服务器</div>
+    <div class="toolbar" style="margin-bottom:8px">
+      <button type="button" id="deploy-select-all" class="button secondary sm">全选</button>
+      <button type="button" id="deploy-select-none" class="button secondary sm">清空</button>
+    </div>
+    <div id="deploy-targets" class="target-picker"></div>
+    <label class="check-line">
+      <input id="deploy-bind-after" type="checkbox">
+      下发成功后，自动将所选服务器切换并绑定为使用此共享密钥认证
+      <small>非常适合新主机先用密码连一次，一键下发公钥后立刻切到密钥认证。</small>
+    </label>
+    <div id="deploy-results" class="batch-results" style="margin-top:10px"></div>
+    <div class="dialog-footer">
+      <button type="button" class="button secondary" data-close="key-deploy-dialog">关闭</button>
+      <button type="submit" class="button primary">开始下发 →</button>
     </div>
   </form>
 </dialog>

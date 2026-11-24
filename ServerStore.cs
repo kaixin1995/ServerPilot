@@ -9,9 +9,9 @@ namespace ServerPilot;
 
 public sealed record ServerInput(string? Name, string? Host, int Port, string? Username, string? AuthType, string? Password, string? PrivateKey, string? Passphrase, string? HostFingerprint, string? Tags, string? Notes,
     bool UseServiceKey = false, bool TryKeyboard = false, string? Proxy = null, string? AllowedRemotePaths = null, string? SharedKeyId = null, string? JumpServerId = null);
-public sealed record SharedKeyInput(string? Name, string? PrivateKey, string? Passphrase);
+public sealed record SharedKeyInput(string? Name, string? PrivateKey, string? Passphrase, string? Notes = null);
 public sealed record ServerView(string Id, string Name, string Host, int Port, string Username, string AuthType, string HostFingerprint, string Tags, string Notes, string UpdatedAt,
-    bool UseServiceKey, bool TryKeyboard, string Proxy, string AllowedRemotePaths, string JumpServerId = "");
+    bool UseServiceKey, bool TryKeyboard, string Proxy, string AllowedRemotePaths, string JumpServerId = "", string SharedKeyId = "");
 public sealed record Credential(string? Password, string? PrivateKey, string? Passphrase, string? ProxyUrl = null);
 public sealed record StoredServer(ServerView View, Credential Credential);
 
@@ -38,14 +38,16 @@ public sealed class ServerStore(AppOptions options)
                 host_fingerprint TEXT NOT NULL, tags TEXT NOT NULL, notes TEXT NOT NULL,
                 credential TEXT NOT NULL, updated_at TEXT NOT NULL,
                 use_service_key INTEGER NOT NULL DEFAULT 0, try_keyboard INTEGER NOT NULL DEFAULT 0, proxy TEXT NOT NULL DEFAULT '',
-                allowed_remote_paths TEXT NOT NULL DEFAULT '', jump_server_id TEXT NOT NULL DEFAULT '');
+                allowed_remote_paths TEXT NOT NULL DEFAULT '', jump_server_id TEXT NOT NULL DEFAULT '', shared_key_id TEXT NOT NULL DEFAULT '');
             CREATE TABLE IF NOT EXISTS audit(
                 id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, actor TEXT NOT NULL,
                 server_name TEXT NOT NULL, action TEXT NOT NULL, result TEXT NOT NULL,
                 detail TEXT NOT NULL DEFAULT '', exit_code INTEGER, duration_ms INTEGER, client_ip TEXT NOT NULL DEFAULT '');
             CREATE INDEX IF NOT EXISTS audit_at_idx ON audit(at);
             CREATE TABLE IF NOT EXISTS shared_keys(
-                id TEXT PRIMARY KEY, name TEXT NOT NULL COLLATE NOCASE UNIQUE, credential TEXT NOT NULL, created_at TEXT NOT NULL);
+                id TEXT PRIMARY KEY, name TEXT NOT NULL COLLATE NOCASE UNIQUE, credential TEXT NOT NULL, created_at TEXT NOT NULL,
+                algorithm TEXT NOT NULL DEFAULT '', fingerprint TEXT NOT NULL DEFAULT '', public_key TEXT NOT NULL DEFAULT '',
+                has_passphrase INTEGER NOT NULL DEFAULT 0, notes TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL DEFAULT '');
             CREATE TABLE IF NOT EXISTS mcp_tokens(
                 id TEXT PRIMARY KEY, name TEXT NOT NULL COLLATE NOCASE UNIQUE, prefix TEXT NOT NULL,
                 token_hash TEXT NOT NULL UNIQUE, read_only INTEGER NOT NULL DEFAULT 0,
@@ -59,6 +61,7 @@ public sealed class ServerStore(AppOptions options)
             """;
         cmd.ExecuteNonQuery();
         EnsureColumns(c);
+        BackfillSharedKeyMetadata(c);
         SeedDefaultSnippets(c);
         CleanupAudit();
         if (!OperatingSystem.IsWindows()) File.SetUnixFileMode(Path.Combine(options.DataDirectory, "serverpilot.db"), UnixFileMode.UserRead | UnixFileMode.UserWrite);
@@ -71,7 +74,16 @@ public sealed class ServerStore(AppOptions options)
             ("try_keyboard", "ALTER TABLE servers ADD COLUMN try_keyboard INTEGER NOT NULL DEFAULT 0"),
             ("proxy", "ALTER TABLE servers ADD COLUMN proxy TEXT NOT NULL DEFAULT ''"),
             ("allowed_remote_paths", "ALTER TABLE servers ADD COLUMN allowed_remote_paths TEXT NOT NULL DEFAULT ''"),
-            ("jump_server_id", "ALTER TABLE servers ADD COLUMN jump_server_id TEXT NOT NULL DEFAULT ''")
+            ("jump_server_id", "ALTER TABLE servers ADD COLUMN jump_server_id TEXT NOT NULL DEFAULT ''"),
+            ("shared_key_id", "ALTER TABLE servers ADD COLUMN shared_key_id TEXT NOT NULL DEFAULT ''")
+        ]);
+        EnsureTableColumns(c, "shared_keys", [
+            ("algorithm", "ALTER TABLE shared_keys ADD COLUMN algorithm TEXT NOT NULL DEFAULT ''"),
+            ("fingerprint", "ALTER TABLE shared_keys ADD COLUMN fingerprint TEXT NOT NULL DEFAULT ''"),
+            ("public_key", "ALTER TABLE shared_keys ADD COLUMN public_key TEXT NOT NULL DEFAULT ''"),
+            ("has_passphrase", "ALTER TABLE shared_keys ADD COLUMN has_passphrase INTEGER NOT NULL DEFAULT 0"),
+            ("notes", "ALTER TABLE shared_keys ADD COLUMN notes TEXT NOT NULL DEFAULT ''"),
+            ("updated_at", "ALTER TABLE shared_keys ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''")
         ]);
         EnsureTableColumns(c, "audit", [
             ("detail", "ALTER TABLE audit ADD COLUMN detail TEXT NOT NULL DEFAULT ''"),
@@ -132,27 +144,31 @@ public sealed class ServerStore(AppOptions options)
     private static ServerView View(SqliteDataReader r) => new(
         r.GetString(0), r.GetString(1), r.GetString(2), r.GetInt32(3), r.GetString(4),
         r.GetString(5), r.GetString(6), r.GetString(7), r.GetString(8), r.GetString(9),
-        r.GetInt32(10) != 0, r.GetInt32(11) != 0, MaskProxy(r.GetString(12)), r.GetString(13), r.GetString(14));
+        r.GetInt32(10) != 0, r.GetInt32(11) != 0, MaskProxy(r.GetString(12)), r.GetString(13), r.GetString(14), r.GetString(15));
 
     public List<ServerView> List()
     {
         using var c = Open(); using var cmd = c.CreateCommand();
-        cmd.CommandText = "SELECT id,name,host,port,username,auth_type,host_fingerprint,tags,notes,updated_at,use_service_key,try_keyboard,proxy,allowed_remote_paths,jump_server_id FROM servers ORDER BY name";
+        cmd.CommandText = "SELECT id,name,host,port,username,auth_type,host_fingerprint,tags,notes,updated_at,use_service_key,try_keyboard,proxy,allowed_remote_paths,jump_server_id,shared_key_id FROM servers ORDER BY name";
         using var r = cmd.ExecuteReader(); var rows = new List<ServerView>(); while (r.Read()) rows.Add(View(r)); return rows;
     }
 
     public StoredServer Get(string idOrName)
     {
         using var c = Open(); using var cmd = c.CreateCommand();
-        cmd.CommandText = "SELECT id,name,host,port,username,auth_type,host_fingerprint,tags,notes,updated_at,use_service_key,try_keyboard,proxy,allowed_remote_paths,jump_server_id,credential FROM servers WHERE id=$id OR name=$id COLLATE NOCASE";
+        cmd.CommandText = "SELECT id,name,host,port,username,auth_type,host_fingerprint,tags,notes,updated_at,use_service_key,try_keyboard,proxy,allowed_remote_paths,jump_server_id,shared_key_id,credential FROM servers WHERE id=$id OR name=$id COLLATE NOCASE";
         cmd.Parameters.AddWithValue("$id", idOrName);
         using var r = cmd.ExecuteReader();
         if (!r.Read()) throw new ArgumentException("找不到指定服务器。请使用服务器 ID 或名称。");
         var view = View(r);
-        var cred = Decrypt(r.GetString(15));
-        // Backwards compatibility: if old row stored an unauthenticated proxy in servers.proxy only
+        var cred = Decrypt(r.GetString(16));
         if (string.IsNullOrWhiteSpace(cred.ProxyUrl) && !string.IsNullOrWhiteSpace(r.GetString(12)))
             cred = cred with { ProxyUrl = r.GetString(12) };
+        if (view.AuthType == "privateKey" && !string.IsNullOrEmpty(view.SharedKeyId))
+        {
+            var shared = GetSharedKey(view.SharedKeyId);
+            cred = new Credential(null, shared.PrivateKey, shared.Passphrase, cred.ProxyUrl);
+        }
         return new(view, cred);
     }
 
@@ -188,20 +204,32 @@ public sealed class ServerStore(AppOptions options)
         var jumpServerId = (input.JumpServerId ?? "").Trim();
         var allowedRemote = NormalizeRemoteRoots(input.AllowedRemotePaths);
         var sameAuth = previous?.View.AuthType == auth;
-        var credential = auth == "password"
-            ? new Credential(!string.IsNullOrEmpty(input.Password) ? input.Password : sameAuth ? previous?.Credential.Password : null, null, null, effectiveProxyUrl)
-            : new Credential(null, !string.IsNullOrWhiteSpace(input.PrivateKey) ? input.PrivateKey : sameAuth ? previous?.Credential.PrivateKey : null,
-                !string.IsNullOrEmpty(input.PrivateKey) ? input.Passphrase : !string.IsNullOrEmpty(input.Passphrase) ? input.Passphrase : sameAuth ? previous?.Credential.Passphrase : null,
-                effectiveProxyUrl);
-        if (auth == "privateKey" && !string.IsNullOrWhiteSpace(input.SharedKeyId))
+        var sharedKeyId = auth == "privateKey" ? (input.SharedKeyId ?? "").Trim() : "";
+
+        Credential credential;
+        if (auth == "privateKey" && !string.IsNullOrEmpty(sharedKeyId))
         {
-            var shared = GetSharedKey(input.SharedKeyId);
-            credential = new Credential(null, shared.PrivateKey, shared.Passphrase, effectiveProxyUrl);
+            // Verify referenced shared key exists; store reference only (no duplicate private key copy)
+            _ = GetSharedKey(sharedKeyId);
+            credential = new Credential(null, null, null, effectiveProxyUrl);
         }
-        if (!input.UseServiceKey)
+        else if (auth == "password")
+        {
+            credential = new Credential(!string.IsNullOrEmpty(input.Password) ? input.Password : sameAuth ? previous?.Credential.Password : null, null, null, effectiveProxyUrl);
+        }
+        else
+        {
+            var prevWasInline = sameAuth && string.IsNullOrEmpty(previous?.View.SharedKeyId);
+            credential = new Credential(null,
+                !string.IsNullOrWhiteSpace(input.PrivateKey) ? input.PrivateKey : prevWasInline ? previous?.Credential.PrivateKey : null,
+                !string.IsNullOrEmpty(input.PrivateKey) ? input.Passphrase : !string.IsNullOrEmpty(input.Passphrase) ? input.Passphrase : prevWasInline ? previous?.Credential.Passphrase : null,
+                effectiveProxyUrl);
+        }
+
+        if (!input.UseServiceKey && string.IsNullOrEmpty(sharedKeyId))
         {
             if (auth == "password" && string.IsNullOrEmpty(credential.Password)) throw new ArgumentException("请输入 SSH 密码。");
-            if (auth == "privateKey" && string.IsNullOrWhiteSpace(credential.PrivateKey)) throw new ArgumentException("请输入 SSH 私钥。");
+            if (auth == "privateKey" && string.IsNullOrWhiteSpace(credential.PrivateKey)) throw new ArgumentException("请选择共享密钥或输入 SSH 私钥。");
         }
         if ((credential.Password?.Length ?? 0) > 4096 || (credential.PrivateKey?.Length ?? 0) > 65536 || (credential.Passphrase?.Length ?? 0) > 4096) throw new ArgumentException("凭据过长。");
         id ??= Guid.NewGuid().ToString("N");
@@ -212,24 +240,41 @@ public sealed class ServerStore(AppOptions options)
         var updated = DateTimeOffset.UtcNow.ToString("O");
         using var c = Open(); using var cmd = c.CreateCommand();
         cmd.CommandText = """
-            INSERT INTO servers (id,name,host,port,username,auth_type,host_fingerprint,tags,notes,credential,updated_at,use_service_key,try_keyboard,proxy,allowed_remote_paths,jump_server_id)
-            VALUES ($id,$name,$host,$port,$username,$auth,$fp,$tags,$notes,$credential,$updated,$serviceKey,$keyboard,$proxy,$allowed,$jump)
+            INSERT INTO servers (id,name,host,port,username,auth_type,host_fingerprint,tags,notes,credential,updated_at,use_service_key,try_keyboard,proxy,allowed_remote_paths,jump_server_id,shared_key_id)
+            VALUES ($id,$name,$host,$port,$username,$auth,$fp,$tags,$notes,$credential,$updated,$serviceKey,$keyboard,$proxy,$allowed,$jump,$sharedKey)
             ON CONFLICT(id) DO UPDATE SET name=$name,host=$host,port=$port,username=$username,auth_type=$auth,
               host_fingerprint=$fp,tags=$tags,notes=$notes,credential=$credential,updated_at=$updated,
-              use_service_key=$serviceKey,try_keyboard=$keyboard,proxy=$proxy,allowed_remote_paths=$allowed,jump_server_id=$jump
+              use_service_key=$serviceKey,try_keyboard=$keyboard,proxy=$proxy,allowed_remote_paths=$allowed,jump_server_id=$jump,shared_key_id=$sharedKey
             """;
         foreach (var (k, v) in new Dictionary<string, object>
         {
             ["$id"] = id, ["$name"] = name, ["$host"] = host, ["$port"] = input.Port, ["$username"] = username,
             ["$auth"] = auth, ["$fp"] = fingerprint, ["$tags"] = Optional(input.Tags, 300), ["$notes"] = Optional(input.Notes, 1000),
             ["$credential"] = Encrypt(credential), ["$updated"] = updated, ["$serviceKey"] = input.UseServiceKey ? 1 : 0,
-            ["$keyboard"] = input.TryKeyboard ? 1 : 0, ["$proxy"] = maskedProxy, ["$allowed"] = allowedRemote, ["$jump"] = jumpServerId
+            ["$keyboard"] = input.TryKeyboard ? 1 : 0, ["$proxy"] = maskedProxy, ["$allowed"] = allowedRemote, ["$jump"] = jumpServerId, ["$sharedKey"] = sharedKeyId
         }) cmd.Parameters.AddWithValue(k, v);
         try { cmd.ExecuteNonQuery(); } catch (SqliteException e) when (e.SqliteErrorCode == 19) { throw new ArgumentException("服务器名称已存在。"); }
         Audit("web", name, previous is null ? "server.create" : "server.update", "success");
         ServerChanged?.Invoke(id);
         return new(id, name, host, input.Port, username, auth, fingerprint, Optional(input.Tags, 300), Optional(input.Notes, 1000), updated,
-            input.UseServiceKey, input.TryKeyboard, maskedProxy, allowedRemote, jumpServerId);
+            input.UseServiceKey, input.TryKeyboard, maskedProxy, allowedRemote, jumpServerId, sharedKeyId);
+    }
+
+    public void BindServerToSharedKey(string serverId, string sharedKeyId)
+    {
+        var server = Get(serverId);
+        _ = GetSharedKey(sharedKeyId);
+        var newCred = new Credential(null, null, null, server.Credential.ProxyUrl);
+        var updated = DateTimeOffset.UtcNow.ToString("O");
+        using var c = Open(); using var cmd = c.CreateCommand();
+        cmd.CommandText = "UPDATE servers SET auth_type='privateKey', shared_key_id=$keyId, credential=$cred, updated_at=$at WHERE id=$id";
+        cmd.Parameters.AddWithValue("$keyId", sharedKeyId);
+        cmd.Parameters.AddWithValue("$cred", Encrypt(newCred));
+        cmd.Parameters.AddWithValue("$at", updated);
+        cmd.Parameters.AddWithValue("$id", server.View.Id);
+        cmd.ExecuteNonQuery();
+        Audit("web", server.View.Name, "server.bind_key", "success");
+        ServerChanged?.Invoke(server.View.Id);
     }
 
     private void ValidateJumpChain(string serverId, string jumpServerId)
@@ -359,12 +404,124 @@ public sealed class ServerStore(AppOptions options)
         r.IsDBNull(7) ? null : r.GetInt64(7),
         r.IsDBNull(8) ? "" : r.GetString(8));
 
-    // --- Shared Keys ---
+    // --- Shared Keys (Reference-Bound Key Vault) ---
+    private sealed record KeyMetadata(string Algorithm, string Fingerprint, string PublicKey, bool HasPassphrase);
+
+    private static KeyMetadata InspectPrivateKey(string privateKey, string? passphrase, string comment)
+    {
+        try
+        {
+            using var stream = new MemoryStream(Encoding.UTF8.GetBytes(privateKey));
+            using var key = string.IsNullOrEmpty(passphrase) ? new Renci.SshNet.PrivateKeyFile(stream) : new Renci.SshNet.PrivateKeyFile(stream, passphrase);
+            var alg = key.HostKeyAlgorithms.FirstOrDefault(a => a.Name == "ssh-rsa")
+                ?? key.HostKeyAlgorithms.FirstOrDefault()
+                ?? throw new ArgumentException("无法识别私钥算法。");
+            var label = alg.Name switch
+            {
+                "ssh-ed25519" => "ED25519",
+                "ssh-rsa" or "rsa-sha2-256" or "rsa-sha2-512" => "RSA",
+                var s when s.StartsWith("ecdsa-", StringComparison.OrdinalIgnoreCase) => "ECDSA",
+                var s => s.ToUpperInvariant()
+            };
+            var fp = "SHA256:" + Convert.ToBase64String(SHA256.HashData(alg.Data)).TrimEnd('=');
+            var safeComment = Regex.Replace(comment, @"\s+", "-").Trim();
+            if (safeComment.Length == 0) safeComment = "serverpilot";
+            var pubKey = $"{alg.Name} {Convert.ToBase64String(alg.Data)} {safeComment}";
+            return new(label, fp, pubKey, !string.IsNullOrEmpty(passphrase));
+        }
+        catch (Exception exception) when (exception is Renci.SshNet.Common.SshException or CryptographicException or ArgumentException or FormatException)
+        {
+            throw new ArgumentException("无法读取私钥，请检查文件格式和口令。");
+        }
+    }
+
+    private static string GeneratePrivateKeyPem(string algorithm)
+    {
+        var alg = (algorithm ?? "ed25519").Trim().ToLowerInvariant();
+        if (alg == "ed25519")
+        {
+            var gen = new Org.BouncyCastle.Crypto.Generators.Ed25519KeyPairGenerator();
+            gen.Init(new Org.BouncyCastle.Crypto.Parameters.Ed25519KeyGenerationParameters(new Org.BouncyCastle.Security.SecureRandom()));
+            var pair = gen.GenerateKeyPair();
+            var blob = Org.BouncyCastle.Crypto.Utilities.OpenSshPrivateKeyUtilities.EncodePrivateKey(pair.Private);
+            var b64 = Convert.ToBase64String(blob);
+            var sb = new StringBuilder();
+            sb.AppendLine("-----BEGIN OPENSSH PRIVATE KEY-----");
+            for (var i = 0; i < b64.Length; i += 70)
+                sb.AppendLine(b64.Substring(i, Math.Min(70, b64.Length - i)));
+            sb.AppendLine("-----END OPENSSH PRIVATE KEY-----");
+            return sb.ToString();
+        }
+        if (alg == "rsa4096")
+        {
+            using var rsa = RSA.Create(4096);
+            return rsa.ExportRSAPrivateKeyPem() + "\n";
+        }
+        throw new ArgumentException("仅支持生成 ed25519 或 rsa4096 密钥。");
+    }
+
+    private void BackfillSharedKeyMetadata(SqliteConnection c)
+    {
+        var pending = new List<(string Id, string Name, string Cred, string CreatedAt)>();
+        using (var sel = c.CreateCommand())
+        {
+            sel.CommandText = "SELECT id,name,credential,created_at FROM shared_keys WHERE fingerprint='' OR public_key=''";
+            using var r = sel.ExecuteReader();
+            while (r.Read()) pending.Add((r.GetString(0), r.GetString(1), r.GetString(2), r.GetString(3)));
+        }
+        foreach (var (id, name, enc, createdAt) in pending)
+        {
+            try
+            {
+                var cred = Decrypt(enc);
+                if (string.IsNullOrWhiteSpace(cred.PrivateKey)) continue;
+                var meta = InspectPrivateKey(cred.PrivateKey, cred.Passphrase, name);
+                using var upd = c.CreateCommand();
+                upd.CommandText = "UPDATE shared_keys SET algorithm=$alg,fingerprint=$fp,public_key=$pub,has_passphrase=$hp,updated_at=CASE WHEN updated_at='' THEN $at ELSE updated_at END WHERE id=$id";
+                upd.Parameters.AddWithValue("$alg", meta.Algorithm);
+                upd.Parameters.AddWithValue("$fp", meta.Fingerprint);
+                upd.Parameters.AddWithValue("$pub", meta.PublicKey);
+                upd.Parameters.AddWithValue("$hp", meta.HasPassphrase ? 1 : 0);
+                upd.Parameters.AddWithValue("$at", createdAt);
+                upd.Parameters.AddWithValue("$id", id);
+                upd.ExecuteNonQuery();
+            }
+            catch { /* Ignore corrupted legacy rows during startup backfill */ }
+        }
+    }
+
     public List<SharedKeySummary> ListSharedKeys()
     {
-        using var c = Open(); using var cmd = c.CreateCommand(); cmd.CommandText = "SELECT id,name,created_at FROM shared_keys ORDER BY name";
-        using var r = cmd.ExecuteReader(); var rows = new List<SharedKeySummary>(); while (r.Read()) rows.Add(new(r.GetString(0), r.GetString(1), r.GetString(2))); return rows;
+        using var c = Open();
+        var boundMap = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+        using (var sCmd = c.CreateCommand())
+        {
+            sCmd.CommandText = "SELECT shared_key_id, name FROM servers WHERE shared_key_id != '' ORDER BY name";
+            using var sr = sCmd.ExecuteReader();
+            while (sr.Read())
+            {
+                var kid = sr.GetString(0);
+                if (!boundMap.TryGetValue(kid, out var list)) boundMap[kid] = list = [];
+                list.Add(sr.GetString(1));
+            }
+        }
+        using var cmd = c.CreateCommand();
+        cmd.CommandText = "SELECT id,name,algorithm,fingerprint,public_key,has_passphrase,notes,created_at,updated_at FROM shared_keys ORDER BY name";
+        using var r = cmd.ExecuteReader();
+        var rows = new List<SharedKeySummary>();
+        while (r.Read())
+        {
+            var id = r.GetString(0);
+            var created = r.GetString(7);
+            var updated = r.GetString(8);
+            rows.Add(new(id, r.GetString(1), r.GetString(2), r.GetString(3), r.GetString(4), r.GetInt32(5) != 0, r.GetString(6), created, string.IsNullOrEmpty(updated) ? created : updated, boundMap.GetValueOrDefault(id) ?? []));
+        }
+        return rows;
     }
+
+    public SharedKeySummary GetSharedKeySummary(string id) =>
+        ListSharedKeys().FirstOrDefault(k => string.Equals(k.Id, id, StringComparison.OrdinalIgnoreCase))
+        ?? throw new ArgumentException("找不到指定的共享私钥。");
 
     private Credential GetSharedKey(string id)
     {
@@ -372,23 +529,91 @@ public sealed class ServerStore(AppOptions options)
         var encrypted = cmd.ExecuteScalar() as string ?? throw new ArgumentException("找不到指定的共享私钥。"); return Decrypt(encrypted);
     }
 
-    public SharedKeyCreatedResult AddSharedKey(SharedKeyInput input)
+    public SharedKeySummary AddSharedKey(SharedKeyInput input)
     {
         var name = Required(input.Name, "密钥名称", 80); var privateKey = input.PrivateKey;
+        var notes = Optional(input.Notes, 500);
         if (string.IsNullOrWhiteSpace(privateKey) || privateKey.Length > 65536 || (input.Passphrase?.Length ?? 0) > 4096) throw new ArgumentException("私钥为空或过长。");
-        try { using var stream = new MemoryStream(Encoding.UTF8.GetBytes(privateKey)); using var key = string.IsNullOrEmpty(input.Passphrase) ? new Renci.SshNet.PrivateKeyFile(stream) : new Renci.SshNet.PrivateKeyFile(stream, input.Passphrase); }
-        catch (Exception exception) when (exception is Renci.SshNet.Common.SshException or CryptographicException or ArgumentException or FormatException) { throw new ArgumentException("无法读取私钥，请检查文件格式和口令。"); }
-        var id = Guid.NewGuid().ToString("N"); using var c = Open(); using var cmd = c.CreateCommand();
-        cmd.CommandText = "INSERT INTO shared_keys(id,name,credential,created_at) VALUES($id,$name,$credential,$created)";
-        cmd.Parameters.AddWithValue("$id", id); cmd.Parameters.AddWithValue("$name", name); cmd.Parameters.AddWithValue("$credential", Encrypt(new Credential(null, privateKey, input.Passphrase))); cmd.Parameters.AddWithValue("$created", DateTimeOffset.UtcNow.ToString("O"));
+        var meta = InspectPrivateKey(privateKey, input.Passphrase, name);
+        var id = Guid.NewGuid().ToString("N");
+        var now = DateTimeOffset.UtcNow.ToString("O");
+        using var c = Open(); using var cmd = c.CreateCommand();
+        cmd.CommandText = "INSERT INTO shared_keys(id,name,credential,created_at,algorithm,fingerprint,public_key,has_passphrase,notes,updated_at) VALUES($id,$name,$credential,$created,$alg,$fp,$pub,$hp,$notes,$updated)";
+        cmd.Parameters.AddWithValue("$id", id);
+        cmd.Parameters.AddWithValue("$name", name);
+        cmd.Parameters.AddWithValue("$credential", Encrypt(new Credential(null, privateKey, input.Passphrase)));
+        cmd.Parameters.AddWithValue("$created", now);
+        cmd.Parameters.AddWithValue("$alg", meta.Algorithm);
+        cmd.Parameters.AddWithValue("$fp", meta.Fingerprint);
+        cmd.Parameters.AddWithValue("$pub", meta.PublicKey);
+        cmd.Parameters.AddWithValue("$hp", meta.HasPassphrase ? 1 : 0);
+        cmd.Parameters.AddWithValue("$notes", notes);
+        cmd.Parameters.AddWithValue("$updated", now);
         try { cmd.ExecuteNonQuery(); } catch (SqliteException exception) when (exception.SqliteErrorCode == 19) { throw new ArgumentException("密钥名称已存在。"); }
-        Audit("web", "-", "key.create", "success"); return new(id, name);
+        Audit("web", "-", "key.create", "success", name);
+        return new(id, name, meta.Algorithm, meta.Fingerprint, meta.PublicKey, meta.HasPassphrase, notes, now, now, []);
+    }
+
+    public SharedKeySummary GenerateSharedKey(GenerateKeyInput input)
+    {
+        var name = Required(input.Name, "密钥名称", 80);
+        var privateKey = GeneratePrivateKeyPem(input.Algorithm ?? "ed25519");
+        return AddSharedKey(new SharedKeyInput(name, privateKey, null, input.Notes));
+    }
+
+    public SharedKeySummary UpdateSharedKey(string id, SharedKeyUpdateInput input)
+    {
+        var existing = GetSharedKeySummary(id);
+        var name = Required(input.Name, "密钥名称", 80);
+        var notes = Optional(input.Notes, 500);
+        var now = DateTimeOffset.UtcNow.ToString("O");
+        var rotating = !string.IsNullOrWhiteSpace(input.PrivateKey);
+        using var c = Open();
+        using var cmd = c.CreateCommand();
+        if (rotating)
+        {
+            if (input.PrivateKey!.Length > 65536 || (input.Passphrase?.Length ?? 0) > 4096) throw new ArgumentException("私钥或口令过长。");
+            var meta = InspectPrivateKey(input.PrivateKey, input.Passphrase, name);
+            cmd.CommandText = "UPDATE shared_keys SET name=$name,credential=$cred,algorithm=$alg,fingerprint=$fp,public_key=$pub,has_passphrase=$hp,notes=$notes,updated_at=$at WHERE id=$id";
+            cmd.Parameters.AddWithValue("$cred", Encrypt(new Credential(null, input.PrivateKey, input.Passphrase)));
+            cmd.Parameters.AddWithValue("$alg", meta.Algorithm);
+            cmd.Parameters.AddWithValue("$fp", meta.Fingerprint);
+            cmd.Parameters.AddWithValue("$pub", meta.PublicKey);
+            cmd.Parameters.AddWithValue("$hp", meta.HasPassphrase ? 1 : 0);
+        }
+        else
+        {
+            cmd.CommandText = "UPDATE shared_keys SET name=$name,notes=$notes,updated_at=$at WHERE id=$id";
+        }
+        cmd.Parameters.AddWithValue("$name", name);
+        cmd.Parameters.AddWithValue("$notes", notes);
+        cmd.Parameters.AddWithValue("$at", now);
+        cmd.Parameters.AddWithValue("$id", existing.Id);
+        try { cmd.ExecuteNonQuery(); } catch (SqliteException e) when (e.SqliteErrorCode == 19) { throw new ArgumentException("密钥名称已存在。"); }
+        if (rotating) ServerChanged?.Invoke(existing.Id);
+        Audit("web", "-", rotating ? "key.rotate" : "key.update", "success", name);
+        return GetSharedKeySummary(existing.Id);
     }
 
     public void DeleteSharedKey(string id)
     {
-        using var c = Open(); using var cmd = c.CreateCommand(); cmd.CommandText = "DELETE FROM shared_keys WHERE id=$id"; cmd.Parameters.AddWithValue("$id", id);
-        if (cmd.ExecuteNonQuery() == 0) throw new ArgumentException("找不到指定的共享私钥。"); Audit("web", "-", "key.delete", "success");
+        using var c = Open();
+        using (var chk = c.CreateCommand())
+        {
+            chk.CommandText = "SELECT name FROM servers WHERE shared_key_id=$id ORDER BY name";
+            chk.Parameters.AddWithValue("$id", id);
+            var names = new List<string>();
+            using var r = chk.ExecuteReader();
+            while (r.Read()) names.Add(r.GetString(0));
+            if (names.Count > 0)
+            {
+                var sample = string.Join("、", names.Take(3)) + (names.Count > 3 ? $" 等 {names.Count} 台" : "");
+                throw new ArgumentException($"该密钥正被服务器（{sample}）使用，请先更换这些服务器的认证方式后再删除。");
+            }
+        }
+        using var cmd = c.CreateCommand(); cmd.CommandText = "DELETE FROM shared_keys WHERE id=$id"; cmd.Parameters.AddWithValue("$id", id);
+        if (cmd.ExecuteNonQuery() == 0) throw new ArgumentException("找不到指定的共享私钥。");
+        Audit("web", "-", "key.delete", "success");
     }
 
     // --- MCP Tokens ---
@@ -675,10 +900,10 @@ public sealed class ServerStore(AppOptions options)
         using (var c = Open())
         using (var cmd = c.CreateCommand())
         {
-            cmd.CommandText = "SELECT id,name,credential,created_at FROM shared_keys ORDER BY name";
+            cmd.CommandText = "SELECT id,name,credential,created_at,algorithm,fingerprint,public_key,has_passphrase,notes,updated_at FROM shared_keys ORDER BY name";
             using var r = cmd.ExecuteReader();
             while (r.Read())
-                sharedKeys.Add(new(r.GetString(0), r.GetString(1), Decrypt(r.GetString(2)), r.GetString(3)));
+                sharedKeys.Add(new(r.GetString(0), r.GetString(1), Decrypt(r.GetString(2)), r.GetString(3), r.GetString(4), r.GetString(5), r.GetString(6), r.GetInt32(7) != 0, r.GetString(8), r.GetString(9)));
         }
 
         var bundle = new BackupBundle(1, DateTimeOffset.UtcNow.ToString("O"), servers, sharedKeys, ListSnippets(), GetAuditRecordDetails(), GetAllowAdminPasswordForMcp());
@@ -747,12 +972,18 @@ public sealed class ServerStore(AppOptions options)
         {
             using var cmd = c.CreateCommand(); cmd.Transaction = tx;
             cmd.CommandText = overwriteExisting
-                ? "INSERT OR REPLACE INTO shared_keys(id,name,credential,created_at) VALUES($id,$name,$cred,$at)"
-                : "INSERT OR IGNORE INTO shared_keys(id,name,credential,created_at) VALUES($id,$name,$cred,$at)";
+                ? "INSERT OR REPLACE INTO shared_keys(id,name,credential,created_at,algorithm,fingerprint,public_key,has_passphrase,notes,updated_at) VALUES($id,$name,$cred,$at,$alg,$fp,$pub,$hp,$notes,$upd)"
+                : "INSERT OR IGNORE INTO shared_keys(id,name,credential,created_at,algorithm,fingerprint,public_key,has_passphrase,notes,updated_at) VALUES($id,$name,$cred,$at,$alg,$fp,$pub,$hp,$notes,$upd)";
             cmd.Parameters.AddWithValue("$id", k.Id);
             cmd.Parameters.AddWithValue("$name", k.Name);
             cmd.Parameters.AddWithValue("$cred", Encrypt(k.Credential));
             cmd.Parameters.AddWithValue("$at", k.CreatedAt);
+            cmd.Parameters.AddWithValue("$alg", k.Algorithm ?? "");
+            cmd.Parameters.AddWithValue("$fp", k.Fingerprint ?? "");
+            cmd.Parameters.AddWithValue("$pub", k.PublicKey ?? "");
+            cmd.Parameters.AddWithValue("$hp", k.HasPassphrase ? 1 : 0);
+            cmd.Parameters.AddWithValue("$notes", k.Notes ?? "");
+            cmd.Parameters.AddWithValue("$upd", string.IsNullOrEmpty(k.UpdatedAt) ? k.CreatedAt : k.UpdatedAt);
             keysImported += cmd.ExecuteNonQuery();
         }
 
@@ -785,8 +1016,8 @@ public sealed class ServerStore(AppOptions options)
             if (exists && !overwriteExisting) { serversSkipped++; continue; }
             using var cmd = c.CreateCommand(); cmd.Transaction = tx;
             cmd.CommandText = """
-                INSERT OR REPLACE INTO servers (id,name,host,port,username,auth_type,host_fingerprint,tags,notes,credential,updated_at,use_service_key,try_keyboard,proxy,allowed_remote_paths,jump_server_id)
-                VALUES ($id,$name,$host,$port,$username,$auth,$fp,$tags,$notes,$cred,$at,$sk,$kb,$proxy,$allowed,$jump)
+                INSERT OR REPLACE INTO servers (id,name,host,port,username,auth_type,host_fingerprint,tags,notes,credential,updated_at,use_service_key,try_keyboard,proxy,allowed_remote_paths,jump_server_id,shared_key_id)
+                VALUES ($id,$name,$host,$port,$username,$auth,$fp,$tags,$notes,$cred,$at,$sk,$kb,$proxy,$allowed,$jump,$sharedKey)
                 """;
             cmd.Parameters.AddWithValue("$id", s.View.Id);
             cmd.Parameters.AddWithValue("$name", s.View.Name);
@@ -797,13 +1028,14 @@ public sealed class ServerStore(AppOptions options)
             cmd.Parameters.AddWithValue("$fp", s.View.HostFingerprint);
             cmd.Parameters.AddWithValue("$tags", s.View.Tags);
             cmd.Parameters.AddWithValue("$notes", s.View.Notes);
-            cmd.Parameters.AddWithValue("$cred", Encrypt(s.Credential));
+            cmd.Parameters.AddWithValue("$cred", Encrypt(string.IsNullOrEmpty(s.View.SharedKeyId) ? s.Credential : new Credential(null, null, null, s.Credential.ProxyUrl)));
             cmd.Parameters.AddWithValue("$at", s.View.UpdatedAt);
             cmd.Parameters.AddWithValue("$sk", s.View.UseServiceKey ? 1 : 0);
             cmd.Parameters.AddWithValue("$kb", s.View.TryKeyboard ? 1 : 0);
             cmd.Parameters.AddWithValue("$proxy", string.IsNullOrWhiteSpace(s.Credential.ProxyUrl) ? s.View.Proxy : MaskProxy(s.Credential.ProxyUrl));
             cmd.Parameters.AddWithValue("$allowed", s.View.AllowedRemotePaths);
             cmd.Parameters.AddWithValue("$jump", s.View.JumpServerId ?? "");
+            cmd.Parameters.AddWithValue("$sharedKey", s.View.SharedKeyId ?? "");
             cmd.ExecuteNonQuery();
             serversImported++;
         }

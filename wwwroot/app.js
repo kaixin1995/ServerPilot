@@ -14,7 +14,8 @@ const iconPaths = {
   logout: '<path d="M9 4H5v16h4m5-12 4 4-4 4M9 12h12"/>',
   folder: '<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>',
   file: '<path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><polyline points="14 3 14 9 20 9"/>',
-  server: '<rect x="3" y="4" width="18" height="6" rx="2"/><rect x="3" y="14" width="18" height="6" rx="2"/><line x1="7" y1="7" x2="7.01" y2="7"/><line x1="7" y1="17" x2="7.01" y2="17"/>'
+  server: '<rect x="3" y="4" width="18" height="6" rx="2"/><rect x="3" y="14" width="18" height="6" rx="2"/><line x1="7" y1="7" x2="7.01" y2="7"/><line x1="7" y1="17" x2="7.01" y2="17"/>',
+  key: '<circle cx="7.5" cy="15.5" r="4.5"/><path d="m21 2-9.6 9.6M15.5 7.5l3 3L22 7l-3-3"/>'
 };
 
 function lineIcon(name) {
@@ -23,12 +24,14 @@ function lineIcon(name) {
 
 for (const [selector, name] of Object.entries({
   '.nav-item[data-view="servers"]>span': 'grid',
+  '.nav-item[data-view="keys"]>span': 'key',
   '.nav-item[data-view="batch"]>span': 'terminal',
   '.nav-item[data-view="files"]>span': 'transfer',
   '.nav-item[data-view="connect"]>span': 'connect',
   '.nav-item[data-view="audit"]>span': 'document',
   '.nav-item[data-view="security"]>span': 'shield',
   '#empty-servers .empty-icon': 'server',
+  '#empty-keys .empty-icon': 'key',
   '#empty-files .empty-icon': 'transfer',
   '#workspace-server-icon': 'server',
   '.hint>span': 'shield'
@@ -38,15 +41,18 @@ for (const [selector, name] of Object.entries({
 }
 
 $('#refresh-servers').innerHTML = lineIcon('refresh');
+$('#refresh-keys').innerHTML = lineIcon('refresh');
 $('#logout').innerHTML = lineIcon('logout') + '退出登录';
 $$('.close').forEach(el => { el.innerHTML = lineIcon('close'); el.setAttribute('aria-label', '关闭'); });
 
 // --- State ---
 let servers = [];
+let sharedKeys = [];
 let snapshots = new Map();
 let snippets = [];
 let tokens = [];
 let selected = null;
+let lastCreatedKey = null;
 let currentSftpPath = '/';
 let editorPath = '';
 let textIncomplete = false;
@@ -145,7 +151,7 @@ async function showApp() {
   $('#login').classList.add('hidden');
   $('#app').classList.remove('hidden');
   renderMcpSnippets();
-  await Promise.all([loadServers(), loadCachedSnapshots(), loadTokens(), loadSnippets()]);
+  await Promise.all([loadSharedKeys(), loadServers(), loadCachedSnapshots(), loadTokens(), loadSnippets()]);
   updateMetrics();
 }
 
@@ -190,12 +196,19 @@ $('#logout').onclick = async () => {
   showLogin();
 };
 
+function navigateTo(view) {
+  const b = $(`.nav-item[data-view="${view}"]`);
+  if (!b) return;
+  b.click();
+}
+
 $$('.nav-item').forEach(b => b.onclick = async () => {
   const view = b.dataset.view;
   $$('.nav-item').forEach(x => x.classList.toggle('active', x === b));
   $$('.page').forEach(x => x.classList.add('hidden'));
   $('#view-' + view).classList.remove('hidden');
   $('#page-title').textContent = b.textContent.trim().replace(/\d+$/, '').trim();
+  if (view === 'keys') await loadSharedKeys();
   if (view === 'files') await loadFiles();
   if (view === 'audit') await loadAudit(1);
   if (view === 'batch') { await loadSnippets(); renderBatchTargets(); }
@@ -275,12 +288,14 @@ function renderResBars(snap) {
 function renderServers() {
   const q = $('#search').value.trim().toLowerCase();
   const byId = new Map(servers.map(s => [s.id, s.name]));
+  const keyById = new Map(sharedKeys.map(k => [k.id, k.name]));
   const filtered = servers.filter(s => [s.name, s.host, s.tags, s.notes].some(v => (v || '').toLowerCase().includes(q)));
   $('#empty-servers').classList.toggle('hidden', servers.length > 0);
   $('#server-rows').innerHTML = filtered.map(s => {
     const snap = snapshots.get(s.id);
     const dotCls = snap ? (snap.online ? 'online' : 'offline') : '';
     const jumpName = s.jumpServerId ? byId.get(s.jumpServerId) : null;
+    const sharedKeyName = s.sharedKeyId ? keyById.get(s.sharedKeyId) : null;
     const latency = snap?.online ? `<span class="badge blue">${snap.latencyMs}ms</span>` : '';
     return `<tr>
       <td>
@@ -295,7 +310,7 @@ function renderServers() {
       <td>
         <div class="mono" style="font-size:12.5px">${escapeHtml(s.username)}@${escapeHtml(s.host)}:${s.port}</div>
         <div class="server-sub">
-          <span class="badge key">${s.authType === 'password' ? '密码' : '私钥'}</span>
+          ${sharedKeyName ? `<span class="badge blue">密钥: ${escapeHtml(sharedKeyName)}</span>` : `<span class="badge key">${s.authType === 'password' ? '密码' : '独立私钥'}</span>`}
           ${s.useServiceKey ? '<span class="badge">服务端密钥</span>' : ''}
           ${s.proxy ? '<span class="badge">代理</span>' : ''}
           ${latency}
@@ -334,51 +349,225 @@ $('#refresh-all-snapshots').onclick = async e => {
   finally { b.disabled = false; }
 };
 
-// --- Add / Edit Server Modal ---
+// --- Add / Edit Server Modal & Standalone SSH Key Management ---
 function authFields() {
   const f = $('#server-form').elements;
-  $('#key-fields').classList.toggle('hidden', f.namedItem('authType').value !== 'privateKey');
-  $('#password-fields').classList.toggle('hidden', f.namedItem('authType').value !== 'password');
+  const isKey = f.namedItem('authType').value === 'privateKey';
+  $('#key-fields').classList.toggle('hidden', !isKey);
+  $('#password-fields').classList.toggle('hidden', isKey);
+  const usingShared = isKey && !!$('#shared-key-select').value;
+  $('#manual-key-fields').classList.toggle('hidden', usingShared);
 }
 $('#server-form').elements.namedItem('authType').onchange = authFields;
-
-async function loadSharedKeys(selectedId = '') {
-  const keys = await api('/api/keys');
-  const select = $('#shared-key-select');
-  select.innerHTML = '<option value="">不使用共享私钥（可手动填写或沿用原私钥）</option>' +
-    keys.map(k => `<option value="${escapeHtml(k.id)}">${escapeHtml(k.name)}</option>`).join('');
-  select.value = selectedId;
-}
-
-$('#save-shared-key').onclick = async e => {
-  const name = $('#shared-key-name').value.trim();
-  const file = $('#shared-key-file').files[0];
-  const passphrase = $('#shared-key-passphrase').value;
-  if (!name || !file) return toast('请输入密钥名称并选择私钥文件');
-  if (file.size > 65536) return toast('私钥文件不能超过 64 KiB');
-  e.target.disabled = true;
-  try {
-    const res = await api('/api/keys', { method: 'POST', body: { name, privateKey: await file.text(), passphrase } });
-    $('#shared-key-name').value = '';
-    $('#shared-key-file').value = '';
-    $('#shared-key-passphrase').value = '';
-    await loadSharedKeys(res.id);
-    toast('共享私钥已加密保存');
-  } catch (err) { toast(err.message); }
-  finally { e.target.disabled = false; }
+$('#shared-key-select').onchange = authFields;
+$('#goto-keys-page').onclick = () => {
+  $('#server-dialog').close();
+  navigateTo('keys');
 };
 
-$('#delete-shared-key').onclick = async e => {
-  const id = $('#shared-key-select').value;
-  if (!id) return toast('请先选择共享私钥');
-  if (!confirm('删除共享私钥？已使用该密钥保存的服务器不受影响。')) return;
-  e.target.disabled = true;
+async function loadSharedKeys(selectedId = null) {
   try {
-    await api('/api/keys/' + encodeURIComponent(id), { method: 'DELETE' });
-    await loadSharedKeys();
-    toast('共享私钥已删除');
+    sharedKeys = await api('/api/keys');
+    $('#nav-keys-count').textContent = sharedKeys.length;
+    $('#metric-keys-total').textContent = sharedKeys.length;
+    const boundCount = sharedKeys.reduce((acc, k) => acc + (k.serverNames?.length || 0), 0);
+    $('#metric-keys-bound').textContent = boundCount;
+    const select = $('#shared-key-select');
+    const prevVal = selectedId !== null ? selectedId : select.value;
+    select.innerHTML = '<option value="">不使用密钥库（手动填写本机专用私钥）</option>' +
+      sharedKeys.map(k => `<option value="${escapeHtml(k.id)}">${escapeHtml(k.name)} [${escapeHtml(k.algorithm || 'KEY')}]</option>`).join('');
+    select.value = prevVal || '';
+    authFields();
+    renderSharedKeys();
+    if (servers.length) renderServers();
   } catch (err) { toast(err.message); }
-  finally { e.target.disabled = false; }
+}
+
+function renderSharedKeys() {
+  const q = ($('#key-search')?.value || '').trim().toLowerCase();
+  const filtered = sharedKeys.filter(k => [k.name, k.algorithm, k.fingerprint, k.notes, ...(k.serverNames || [])].some(v => (v || '').toLowerCase().includes(q)));
+  $('#empty-keys').classList.toggle('hidden', sharedKeys.length > 0);
+  $('#key-rows').innerHTML = filtered.map(k => {
+    const names = k.serverNames || [];
+    const boundHtml = names.length
+      ? names.slice(0, 3).map(n => `<span class="badge blue">${escapeHtml(n)}</span>`).join('') + (names.length > 3 ? `<span class="badge">+${names.length - 3}</span>` : '')
+      : '<span class="server-sub">暂未绑定</span>';
+    return `<tr>
+      <td>
+        <div class="server-name">${escapeHtml(k.name)}${k.hasPassphrase ? '<span class="badge warn">带口令</span>' : ''}</div>
+        <div class="server-sub">${escapeHtml(k.notes || '无备注')}</div>
+      </td>
+      <td>
+        <div><span class="badge blue">${escapeHtml(k.algorithm || 'SSH')}</span></div>
+        <div class="mono server-sub" title="${escapeHtml(k.fingerprint)}">${escapeHtml(k.fingerprint || '—')}</div>
+      </td>
+      <td>${boundHtml}</td>
+      <td style="font-size:12px;white-space:nowrap">${fmtDate(k.updatedAt || k.createdAt)}</td>
+      <td>
+        <div class="row-actions">
+          <button type="button" class="link-button pill-primary" data-key-copy="${k.id}">复制公钥</button>
+          <button type="button" class="link-button" data-key-deploy="${k.id}">下发公钥</button>
+          <button type="button" class="link-button secondary-action" data-key-edit="${k.id}">编辑 / 轮换</button>
+          <button type="button" class="link-button danger" data-key-del="${k.id}">删除</button>
+        </div>
+      </td>
+    </tr>`;
+  }).join('');
+}
+
+$('#key-search').oninput = renderSharedKeys;
+$('#refresh-keys').onclick = () => loadSharedKeys();
+
+function showNewKeyBanner(k) {
+  lastCreatedKey = k;
+  $('#new-key-banner-title').textContent = `密钥「${k.name}」已保存（${k.algorithm} · ${k.fingerprint}）`;
+  $('#new-key-pub').textContent = k.publicKey || '';
+  $('#new-key-banner').classList.remove('hidden');
+}
+
+$('#copy-new-key-pub').onclick = () => { if (lastCreatedKey?.publicKey) copyText(lastCreatedKey.publicKey, '公钥已复制'); };
+$('#deploy-new-key-btn').onclick = () => { if (lastCreatedKey) openDeployKeyDialog(lastCreatedKey); };
+
+function openGenerateKeyDialog() {
+  $('#key-generate-form').reset();
+  $('#key-gen-error').textContent = '';
+  $('#key-generate-dialog').showModal();
+}
+$('#open-generate-key').onclick = openGenerateKeyDialog;
+$('#empty-gen-key').onclick = openGenerateKeyDialog;
+
+$('#key-generate-form').onsubmit = async e => {
+  e.preventDefault();
+  const f = e.target, b = e.submitter;
+  b.disabled = true;
+  $('#key-gen-error').textContent = '';
+  try {
+    const data = Object.fromEntries(new FormData(f));
+    const created = await api('/api/keys/generate', { method: 'POST', body: data });
+    $('#key-generate-dialog').close();
+    showNewKeyBanner(created);
+    await loadSharedKeys();
+    toast('密钥对已生成并加密保存');
+  } catch (err) { $('#key-gen-error').textContent = err.message; }
+  finally { b.disabled = false; }
+};
+
+function openEditKeyDialog(k = null) {
+  const f = $('#key-edit-form');
+  f.reset();
+  $('#key-edit-error').textContent = '';
+  f.elements.namedItem('id').value = k?.id || '';
+  f.elements.namedItem('name').value = k?.name || '';
+  f.elements.namedItem('notes').value = k?.notes || '';
+  $('#key-edit-title').textContent = k ? `编辑 / 轮换密钥：${k.name}` : '导入已有私钥';
+  $('#key-edit-desc').textContent = k
+    ? '可修改名称和备注；如填写新私钥将立即轮换，所有已绑定服务器自动生效。'
+    : '上传私钥文件或粘贴私钥内容，服务端将自动提取算法、公钥与 SHA-256 指纹。';
+  $('#key-edit-req').classList.toggle('hidden', !!k);
+  f.elements.namedItem('privateKey').placeholder = k ? '留空表示保留当前私钥；填写新私钥将轮换覆盖' : '粘贴 -----BEGIN OPENSSH PRIVATE KEY----- 或 PEM 私钥内容';
+  $('#key-edit-dialog').showModal();
+}
+$('#open-import-key').onclick = () => openEditKeyDialog();
+$('#empty-imp-key').onclick = () => openEditKeyDialog();
+
+$('#key-edit-file').onchange = async e => {
+  const file = e.target.files[0];
+  if (!file) return;
+  if (file.size > 65536) { toast('私钥文件不能超过 64 KiB'); e.target.value = ''; return; }
+  $('#key-edit-form').elements.namedItem('privateKey').value = await file.text();
+  if (!$('#key-edit-form').elements.namedItem('name').value.trim()) {
+    $('#key-edit-form').elements.namedItem('name').value = file.name.replace(/\.[^.]+$/, '');
+  }
+};
+
+$('#key-edit-form').onsubmit = async e => {
+  e.preventDefault();
+  const f = e.target, id = f.elements.namedItem('id').value, b = e.submitter;
+  b.disabled = true;
+  $('#key-edit-error').textContent = '';
+  try {
+    const data = Object.fromEntries(new FormData(f));
+    delete data.id;
+    const saved = await api('/api/keys' + (id ? '/' + encodeURIComponent(id) : ''), { method: id ? 'PUT' : 'POST', body: data });
+    $('#key-edit-dialog').close();
+    if (!id || data.privateKey?.trim()) showNewKeyBanner(saved);
+    await loadSharedKeys();
+    toast(id ? (data.privateKey?.trim() ? '密钥已轮换，已绑定服务器自动生效' : '密钥信息已更新') : '私钥已导入并加密保存');
+  } catch (err) { $('#key-edit-error').textContent = err.message; }
+  finally { b.disabled = false; }
+};
+
+function openDeployKeyDialog(k) {
+  $('#deploy-key-id').value = k.id;
+  $('#key-deploy-subtitle').textContent = `密钥「${k.name}」(${k.algorithm} · ${k.fingerprint})`;
+  $('#deploy-key-pub').textContent = k.publicKey || '';
+  $('#deploy-bind-after').checked = false;
+  $('#deploy-results').innerHTML = '';
+  $('#deploy-targets').innerHTML = servers.length
+    ? servers.map(s => `<label class="target-chip"><input type="checkbox" name="deployServer" value="${s.id}" ${s.sharedKeyId === k.id ? '' : ''}>${escapeHtml(s.name)} <small style="display:inline;margin:0;color:var(--muted)">(${escapeHtml(s.username)}@${escapeHtml(s.host)})</small></label>`).join('')
+    : '<span class="footnote">暂无可用服务器，请先添加服务器。</span>';
+  $('#key-deploy-dialog').showModal();
+}
+
+$('#copy-deploy-pub').onclick = () => copyText($('#deploy-key-pub').textContent, '公钥已复制');
+$('#deploy-select-all').onclick = () => $$('input[name="deployServer"]').forEach(c => c.checked = true);
+$('#deploy-select-none').onclick = () => $$('input[name="deployServer"]').forEach(c => c.checked = false);
+
+$('#key-deploy-form').onsubmit = async e => {
+  e.preventDefault();
+  const keyId = $('#deploy-key-id').value;
+  const serverIds = $$('input[name="deployServer"]:checked').map(c => c.value);
+  if (!serverIds.length) return toast('请至少选择一台目标服务器');
+  const bindAfterDeploy = $('#deploy-bind-after').checked;
+  const b = e.submitter;
+  b.disabled = true;
+  $('#deploy-results').innerHTML = '<p class="footnote">正在向所选主机下发公钥…</p>';
+  try {
+    const r = await api(`/api/keys/${encodeURIComponent(keyId)}/deploy`, { method: 'POST', body: { serverIds, bindAfterDeploy } });
+    $('#deploy-results').innerHTML = r.results.map(item => `<div class="batch-card">
+      <div class="batch-card-head">
+        <strong>${escapeHtml(item.serverName)}</strong>
+        <span class="badge ${item.success ? 'ok' : 'danger'}">${item.success ? (item.alreadyInstalled ? '已存在' : '下发成功') : '失败'}</span>
+      </div>
+      <div style="padding:10px 14px;font-size:12.5px;color:var(--ink-secondary)">${escapeHtml(item.message)}</div>
+    </div>`).join('');
+    if (bindAfterDeploy) await Promise.all([loadServers(), loadSharedKeys()]);
+    toast(`公钥下发完成：成功 ${r.succeeded} / ${r.total}`);
+  } catch (err) {
+    $('#deploy-results').innerHTML = `<p class="error">${escapeHtml(err.message)}</p>`;
+  } finally { b.disabled = false; }
+};
+
+$('#key-rows').onclick = async e => {
+  const copyBtn = e.target.closest('[data-key-copy]');
+  if (copyBtn) {
+    const k = sharedKeys.find(x => x.id === copyBtn.dataset.keyCopy);
+    if (k?.publicKey) copyText(k.publicKey, `已复制「${k.name}」的公钥`);
+    return;
+  }
+  const depBtn = e.target.closest('[data-key-deploy]');
+  if (depBtn) {
+    const k = sharedKeys.find(x => x.id === depBtn.dataset.keyDeploy);
+    if (k) openDeployKeyDialog(k);
+    return;
+  }
+  const editBtn = e.target.closest('[data-key-edit]');
+  if (editBtn) {
+    const k = sharedKeys.find(x => x.id === editBtn.dataset.keyEdit);
+    if (k) openEditKeyDialog(k);
+    return;
+  }
+  const delBtn = e.target.closest('[data-key-del]');
+  if (delBtn) {
+    const k = sharedKeys.find(x => x.id === delBtn.dataset.keyDel);
+    if (!k) return;
+    if (!confirm(`确认永久删除共享密钥「${k.name}」？`)) return;
+    try {
+      await api('/api/keys/' + encodeURIComponent(k.id), { method: 'DELETE' });
+      await loadSharedKeys();
+      toast('共享密钥已删除');
+    } catch (err) { toast(err.message); }
+  }
 };
 
 $('#probe-host').onclick = async e => {
@@ -436,8 +625,8 @@ function editServer(s, prefill = null) {
   x.namedItem('privateKey').placeholder = s ? '留空以保留原私钥' : '粘贴私钥内容，仅在服务器端加密保存';
   x.namedItem('password').placeholder = s ? '留空以保留原密码' : '仅在服务器端加密保存';
   populateJumpSelect(s?.id || '', src.jumpServerId || '');
+  loadSharedKeys(s?.sharedKeyId || '').then(() => authFields()).catch(err => toast(err.message));
   authFields();
-  loadSharedKeys().catch(err => toast(err.message));
   $('#server-dialog').showModal();
 }
 
@@ -458,7 +647,7 @@ $('#server-form').onsubmit = async e => {
     await api('/api/servers' + (id ? '/' + id : ''), { method: id ? 'PUT' : 'POST', body: data });
     f.reset();
     $('#server-dialog').close();
-    await loadServers();
+    await Promise.all([loadServers(), loadSharedKeys()]);
     toast('服务器已保存');
   } catch (err) {
     $('#server-error').textContent = err.message;
@@ -578,7 +767,7 @@ $('#server-rows').onclick = async e => {
     if (b.dataset.action === 'delete' && confirm(`确认删除服务器「${s.name}」？此操作不会影响远端主机。`)) {
       await api(`/api/servers/${s.id}`, { method: 'DELETE' });
       snapshots.delete(s.id);
-      await loadServers();
+      await Promise.all([loadServers(), loadSharedKeys()]);
       toast('服务器已删除');
     }
   } catch (err) { toast(err.message); }
@@ -1545,7 +1734,7 @@ $('#backup-import-form').onsubmit = async e => {
     });
     $('#backup-import-result').textContent = `导入完成：服务器 ${r.serversImported} 台（跳过 ${r.serversSkipped} 台）、共享私钥 ${r.sharedKeysImported} 个、命令片段 ${r.snippetsImported} 条。`;
     $('#backup-import-form').reset();
-    await Promise.all([loadServers(), loadSnippets(), loadSettings()]);
+    await Promise.all([loadSharedKeys(), loadServers(), loadSnippets(), loadSettings()]);
     toast('备份已恢复');
   } catch (err) {
     $('#backup-import-result').textContent = err.message;

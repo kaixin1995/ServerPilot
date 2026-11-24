@@ -81,8 +81,12 @@ public sealed record SshConfigParseResult(List<ParsedSshHost> Hosts);
 // --- Audit, Keys, Snippets, Tokens, Settings, Notifications, Backup ---
 public sealed record AuditItem(string At, string Actor, string Server, string Action, string Result, string Detail, int? ExitCode, long? DurationMs, string ClientIp);
 public sealed record AuditPageResult(List<AuditItem> Items, int Page, int PageSize, long Total, long TotalPages);
-public sealed record SharedKeySummary(string Id, string Name, string CreatedAt);
-public sealed record SharedKeyCreatedResult(string Id, string Name);
+public sealed record SharedKeySummary(string Id, string Name, string Algorithm, string Fingerprint, string PublicKey, bool HasPassphrase, string Notes, string CreatedAt, string UpdatedAt, List<string> ServerNames);
+public sealed record SharedKeyUpdateInput(string? Name, string? PrivateKey, string? Passphrase, string? Notes);
+public sealed record GenerateKeyInput(string? Name, string? Algorithm = "ed25519", string? Notes = null);
+public sealed record DeployKeyInput(List<string> ServerIds, bool BindAfterDeploy = false);
+public sealed record DeployKeyItemResult(string ServerId, string ServerName, bool Success, bool AlreadyInstalled, bool Bound, string Message);
+public sealed record DeployKeyResult(string KeyId, string KeyName, int Total, int Succeeded, int Failed, List<DeployKeyItemResult> Results);
 
 public sealed record SnippetInput(string? Name, string? Category, string? Command, string? Description);
 public sealed record SnippetView(string Id, string Name, string Category, string Command, string Description, string UpdatedAt);
@@ -132,7 +136,7 @@ public sealed record BackupExportInput(string? Passphrase);
 public sealed record BackupImportInput(string? Passphrase, string? Payload, bool OverwriteExisting = false);
 public sealed record BackupEnvelope(int Version, string CreatedAt, string Salt, string Nonce, string Tag, string Ciphertext);
 public sealed record BackupServerRecord(ServerView View, Credential Credential);
-public sealed record BackupSharedKeyRecord(string Id, string Name, Credential Credential, string CreatedAt);
+public sealed record BackupSharedKeyRecord(string Id, string Name, Credential Credential, string CreatedAt, string Algorithm = "", string Fingerprint = "", string PublicKey = "", bool HasPassphrase = false, string Notes = "", string UpdatedAt = "");
 public sealed record BackupBundle(int Version, string ExportedAt, List<BackupServerRecord> Servers, List<BackupSharedKeyRecord> SharedKeys, List<SnippetView> Snippets, bool AuditRecordDetails, bool AllowAdminPasswordForMcp);
 public sealed record BackupImportResult(int ServersImported, int ServersSkipped, int SharedKeysImported, int SnippetsImported);
 
@@ -185,6 +189,11 @@ internal sealed partial class StorageJsonContext : JsonSerializerContext;
 [JsonSerializable(typeof(SshConfigImportInput))]
 [JsonSerializable(typeof(ServerInput))]
 [JsonSerializable(typeof(SharedKeyInput))]
+[JsonSerializable(typeof(SharedKeyUpdateInput))]
+[JsonSerializable(typeof(GenerateKeyInput))]
+[JsonSerializable(typeof(DeployKeyInput))]
+[JsonSerializable(typeof(DeployKeyItemResult))]
+[JsonSerializable(typeof(DeployKeyResult))]
 [JsonSerializable(typeof(SnippetInput))]
 [JsonSerializable(typeof(McpTokenInput))]
 [JsonSerializable(typeof(SystemSettingsInput))]
@@ -202,7 +211,6 @@ internal sealed partial class StorageJsonContext : JsonSerializerContext;
 [JsonSerializable(typeof(AuditPageResult))]
 [JsonSerializable(typeof(SharedKeySummary))]
 [JsonSerializable(typeof(List<SharedKeySummary>))]
-[JsonSerializable(typeof(SharedKeyCreatedResult))]
 [JsonSerializable(typeof(SnippetView))]
 [JsonSerializable(typeof(List<SnippetView>))]
 [JsonSerializable(typeof(McpTokenView))]

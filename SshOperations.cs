@@ -661,6 +661,70 @@ public sealed class SshOperations : IDisposable
         return new BatchExecuteResult(command, results.Count, succeeded, results.Count - succeeded, results);
     }
 
+    // --- Deploy Public Key to Remote ~/.ssh/authorized_keys ---
+    public async Task<DeployKeyResult> DeploySharedKey(string keyId, List<string>? serverIds, bool bindAfterDeploy, string actor, CancellationToken ct)
+    {
+        var key = store.GetSharedKeySummary(keyId);
+        if (string.IsNullOrWhiteSpace(key.PublicKey))
+            throw new InvalidOperationException("该密钥缺少可用公钥。");
+        var idSet = (serverIds ?? []).Where(x => !string.IsNullOrWhiteSpace(x)).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        if (idSet.Count == 0) throw new ArgumentException("请至少选择一台目标服务器。");
+        var targets = store.List().Where(s => idSet.Contains(s.Id) || idSet.Contains(s.Name)).ToList();
+        if (targets.Count == 0) throw new ArgumentException("未找到指定的目标服务器。");
+
+        var parts = key.PublicKey.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        var matchToken = parts.Length >= 2 ? parts[0] + " " + parts[1] : key.PublicKey;
+        var pubB64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(key.PublicKey));
+        var tokB64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(matchToken));
+        var script = $$"""
+            set -e
+            mkdir -p "$HOME/.ssh"
+            chmod 700 "$HOME/.ssh"
+            auth="$HOME/.ssh/authorized_keys"
+            touch "$auth"
+            chmod 600 "$auth"
+            pub=$(printf '%s' '{{pubB64}}' | base64 -d)
+            tok=$(printf '%s' '{{tokB64}}' | base64 -d)
+            if grep -Fq "$tok" "$auth" 2>/dev/null; then
+              echo '__SP_EXISTS__'
+            else
+              if [ -s "$auth" ] && [ -n "$(tail -c 1 "$auth" 2>/dev/null)" ]; then printf '\n' >> "$auth"; fi
+              printf '%s\n' "$pub" >> "$auth"
+              echo '__SP_ADDED__'
+            fi
+            """;
+
+        using var sem = new SemaphoreSlim(6);
+        var tasks = targets.Select(async srv =>
+        {
+            await sem.WaitAsync(ct);
+            try
+            {
+                var r = await Logged(srv.Id, actor, "key.deploy", s => ExecuteCoreAsync(s, script, 30, ct), key.Name, x => x.ExitCode);
+                if (r.ExitCode != 0)
+                    return new DeployKeyItemResult(srv.Id, srv.Name, false, false, false, string.IsNullOrWhiteSpace(r.Stderr) ? $"退出码 {r.ExitCode}" : r.Stderr.Trim());
+                var already = r.Stdout.Contains("__SP_EXISTS__", StringComparison.Ordinal);
+                var bound = false;
+                if (bindAfterDeploy)
+                {
+                    store.BindServerToSharedKey(srv.Id, key.Id);
+                    bound = true;
+                }
+                var msg = already ? "公钥已存在" : "公钥已写入 ~/.ssh/authorized_keys";
+                if (bound) msg += "，并已自动绑定此密钥";
+                return new DeployKeyItemResult(srv.Id, srv.Name, true, already, bound, msg);
+            }
+            catch (Exception e)
+            {
+                return new DeployKeyItemResult(srv.Id, srv.Name, false, false, false, Errors.Public(e));
+            }
+            finally { sem.Release(); }
+        });
+        var items = (await Task.WhenAll(tasks)).ToList();
+        var ok = items.Count(x => x.Success);
+        return new DeployKeyResult(key.Id, key.Name, items.Count, ok, items.Count - ok, items);
+    }
+
     // --- Staging & Path Validation ---
     private string StagingPath(string name)
     {

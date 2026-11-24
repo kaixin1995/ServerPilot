@@ -406,7 +406,11 @@ api.MapPost("/servers/{id}/jobs/cleanup", (string id, JobCleanupInput input, Job
 // --- Shared Keys, Snippets, MCP Tokens, Audit ---
 api.MapGet("/keys", (ServerStore store) => TypedResults.Ok(store.ListSharedKeys()));
 api.MapPost("/keys", (SharedKeyInput input, ServerStore store) => Safe(() => TypedResults.Ok(store.AddSharedKey(input))));
+api.MapPost("/keys/generate", (GenerateKeyInput input, ServerStore store) => Safe(() => TypedResults.Ok(store.GenerateSharedKey(input))));
+api.MapPut("/keys/{id}", (string id, SharedKeyUpdateInput input, ServerStore store) => Safe(() => TypedResults.Ok(store.UpdateSharedKey(id, input))));
 api.MapDelete("/keys/{id}", (string id, ServerStore store) => Safe(() => { store.DeleteSharedKey(id); return TypedResults.Ok(); }));
+api.MapPost("/keys/{id}/deploy", async (string id, DeployKeyInput input, SshOperations ssh, CancellationToken ct) =>
+    await SafeAsync(async () => TypedResults.Ok(await ssh.DeploySharedKey(id, input.ServerIds, input.BindAfterDeploy, "web", ct))));
 
 api.MapGet("/snippets", (ServerStore store) => TypedResults.Ok(store.ListSnippets()));
 api.MapPost("/snippets", (SnippetInput input, ServerStore store) => Safe(() => TypedResults.Ok(store.SaveSnippet(null, input))));
