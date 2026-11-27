@@ -58,6 +58,8 @@ public sealed class ServerStore(AppOptions options)
                 command TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS settings(
                 key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS server_snapshots(
+                server_id TEXT PRIMARY KEY, payload TEXT NOT NULL, checked_at TEXT NOT NULL);
             """;
         cmd.ExecuteNonQuery();
         EnsureColumns(c);
@@ -313,8 +315,45 @@ public sealed class ServerStore(AppOptions options)
         cmd.CommandText = "DELETE FROM servers WHERE id=$id";
         cmd.Parameters.AddWithValue("$id", s.View.Id);
         cmd.ExecuteNonQuery();
+        DeleteSnapshot(s.View.Id);
         Audit("web", s.View.Name, "server.delete", "success");
         ServerChanged?.Invoke(s.View.Id);
+    }
+
+    public void SaveSnapshot(ServerSnapshot snap)
+    {
+        using var c = Open(); using var cmd = c.CreateCommand();
+        cmd.CommandText = "INSERT OR REPLACE INTO server_snapshots(server_id, payload, checked_at) VALUES ($id, $payload, $at)";
+        cmd.Parameters.AddWithValue("$id", snap.ServerId);
+        cmd.Parameters.AddWithValue("$payload", JsonSerializer.Serialize(snap, ApiJsonContext.Default.ServerSnapshot));
+        cmd.Parameters.AddWithValue("$at", snap.CheckedAt);
+        cmd.ExecuteNonQuery();
+    }
+
+    public List<ServerSnapshot> LoadSnapshots()
+    {
+        var list = new List<ServerSnapshot>();
+        using var c = Open(); using var cmd = c.CreateCommand();
+        cmd.CommandText = "SELECT s.payload FROM server_snapshots s INNER JOIN servers srv ON srv.id = s.server_id";
+        using var r = cmd.ExecuteReader();
+        while (r.Read())
+        {
+            try
+            {
+                var snap = JsonSerializer.Deserialize(r.GetString(0), ApiJsonContext.Default.ServerSnapshot);
+                if (snap is not null) list.Add(snap);
+            }
+            catch { }
+        }
+        return list;
+    }
+
+    public void DeleteSnapshot(string serverId)
+    {
+        using var c = Open(); using var cmd = c.CreateCommand();
+        cmd.CommandText = "DELETE FROM server_snapshots WHERE server_id=$id";
+        cmd.Parameters.AddWithValue("$id", serverId);
+        cmd.ExecuteNonQuery();
     }
 
     // --- Audit ---

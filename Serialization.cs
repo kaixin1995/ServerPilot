@@ -70,7 +70,9 @@ public sealed record ServerSnapshot(
     int? DockerRunning,
     int? DockerTotal,
     int? FailedServices,
-    string? Error);
+    string? Error,
+    long? DiskTotalMb = null,
+    long? DiskUsedMb = null);
 
 public sealed record BatchItemResult(string ServerId, string ServerName, bool Success, int? ExitCode, string? ExitSignal, string Stdout, string Stderr, bool OutputTruncated, long DurationMs, string? Error);
 public sealed record BatchExecuteResult(string Command, int Total, int Succeeded, int Failed, List<BatchItemResult> Results);

@@ -66,6 +66,8 @@ public sealed class SshOperations : IDisposable
         this.options = options;
         this.notifications = notifications;
         this.logger = logger;
+        foreach (var snap in store.LoadSnapshots())
+            _snapshots[snap.ServerId] = snap;
         store.ServerChanged += InvalidateServerPool;
         _evictionTimer = new Timer(_ => EvictIdle(), null, TimeSpan.FromMinutes(1), TimeSpan.FromMinutes(1));
     }
@@ -139,6 +141,7 @@ public sealed class SshOperations : IDisposable
         foreach (var k in _sftpPool.Keys.ToList())
             if (_sftpPool.TryRemove(k, out var st)) while (st.TryPop(out var item)) item.Dispose();
         _snapshots.TryRemove(serverId, out _);
+        store.DeleteSnapshot(serverId);
     }
 
     private void EvictIdle()
@@ -543,7 +546,7 @@ public sealed class SshOperations : IDisposable
             echo "LOAD=$(cat /proc/loadavg 2>/dev/null | awk '{print $1" "$2" "$3}' || uptime 2>/dev/null | awk -F'load average:' '{print $2}' | xargs)"
             echo "CPU=$(awk '/^cpu /{u=$2+$4; t=$2+$4+$5; if(t>0) printf "%.1f", (u*100)/t}' /proc/stat 2>/dev/null || echo '')"
             echo "MEM=$(free -m 2>/dev/null | awk '/^Mem:/{print $2" "$3}' || echo '')"
-            echo "DISK=$(df -BG / 2>/dev/null | awk 'NR==2{gsub(/G/,"",$2); gsub(/G/,"",$3); gsub(/%/,"",$5); print $2" "$3" "$5}' || df -k / 2>/dev/null | awk 'NR==2{gsub(/%/,"",$5); printf "%d %d %s", $2/1048576, $3/1048576, $5}')"
+            echo "DISK_KB=$((df -Pk / 2>/dev/null || df -k / 2>/dev/null) | awk 'NR==2{gsub(/%/,"",$5); print $2" "$3" "$5}' || echo '')"
             PORTS=$(ss -tlnH 2>/dev/null | awk '{print $4}' | sed 's/.*://' | sort -nu | tr '\n' ',' | sed 's/,$//' || true)
             echo "PORTS=$PORTS"
             if command -v docker >/dev/null 2>&1; then
@@ -575,11 +578,24 @@ public sealed class SshOperations : IDisposable
             {
                 memTotal = mt; memUsed = mu; memPct = Math.Round(mu * 100.0 / mt, 1);
             }
-            long? diskTotal = null, diskUsed = null; double? diskPct = null;
-            var diskParts = (kv.GetValueOrDefault("DISK") ?? "").Split(' ', StringSplitOptions.RemoveEmptyEntries);
-            if (diskParts.Length >= 3 && long.TryParse(diskParts[0], out var dt) && long.TryParse(diskParts[1], out var du) && double.TryParse(diskParts[2], CultureInfo.InvariantCulture, out var dp))
+            long? diskTotal = null, diskUsed = null, diskTotalMb = null, diskUsedMb = null; double? diskPct = null;
+            var diskKbParts = (kv.GetValueOrDefault("DISK_KB") ?? "").Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            if (diskKbParts.Length >= 3 && long.TryParse(diskKbParts[0], out var dtKb) && long.TryParse(diskKbParts[1], out var duKb) && double.TryParse(diskKbParts[2], CultureInfo.InvariantCulture, out var dpKb))
             {
-                diskTotal = dt; diskUsed = du; diskPct = Math.Round(dp, 1);
+                diskTotalMb = dtKb / 1024;
+                diskUsedMb = duKb / 1024;
+                diskTotal = (long)Math.Round(dtKb / 1048576.0);
+                diskUsed = (long)Math.Round(duKb / 1048576.0);
+                diskPct = Math.Round(dpKb, 1);
+            }
+            else
+            {
+                var diskParts = (kv.GetValueOrDefault("DISK") ?? "").Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                if (diskParts.Length >= 3 && long.TryParse(diskParts[0], out var dt) && long.TryParse(diskParts[1], out var du) && double.TryParse(diskParts[2], CultureInfo.InvariantCulture, out var dp))
+                {
+                    diskTotal = dt; diskUsed = du; diskPct = Math.Round(dp, 1);
+                    diskTotalMb = dt * 1024; diskUsedMb = du * 1024;
+                }
             }
             var portsStr = kv.GetValueOrDefault("PORTS") ?? "";
             var portsList = portsStr.Split(',', StringSplitOptions.RemoveEmptyEntries);
@@ -596,9 +612,10 @@ public sealed class SshOperations : IDisposable
                 kv.GetValueOrDefault("HOST"), kv.GetValueOrDefault("OS"), kv.GetValueOrDefault("KERNEL"), kv.GetValueOrDefault("UPTIME"),
                 cores, cpuPct, memTotal, memUsed, memPct, diskTotal, diskUsed, diskPct,
                 kv.GetValueOrDefault("LOAD"), portsList.Length, portsList.Length > 0 ? string.Join(", ", portsList.Take(20)) : "",
-                dockerRun, dockerTot, failedSvc, null);
+                dockerRun, dockerTot, failedSvc, null, diskTotalMb, diskUsedMb);
 
             _snapshots[server.View.Id] = snap;
+            store.SaveSnapshot(snap);
             store.Audit(actor, server.View.Name, "ssh.snapshot", "success", null, res.ExitCode, sw.ElapsedMilliseconds);
 
             if ((diskPct.HasValue && diskPct.Value >= 90) || (memPct.HasValue && memPct.Value >= 90))
@@ -612,6 +629,7 @@ public sealed class SshOperations : IDisposable
                 server.View.Id, server.View.Name, false, sw.ElapsedMilliseconds, DateTimeOffset.UtcNow.ToString("O"),
                 null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, Errors.Public(e));
             _snapshots[server.View.Id] = snap;
+            store.SaveSnapshot(snap);
             store.Audit(actor, server.View.Name, "ssh.snapshot", "failed", null, null, sw.ElapsedMilliseconds);
             notifications.Fire("alert", $"服务器离线告警：{server.View.Name}", $"主机 {server.View.Host}:{server.View.Port} 连接失败：{Errors.Public(e)}");
             return snap;

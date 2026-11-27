@@ -49,6 +49,7 @@ $$('.close').forEach(el => { el.innerHTML = lineIcon('close'); el.setAttribute('
 let servers = [];
 let sharedKeys = [];
 let snapshots = new Map();
+const collectingSnapshots = new Set();
 let snippets = [];
 let tokens = [];
 let selected = null;
@@ -153,6 +154,7 @@ async function showApp() {
   renderMcpSnippets();
   await Promise.all([loadSharedKeys(), loadServers(), loadCachedSnapshots(), loadTokens(), loadSnippets()]);
   updateMetrics();
+  collectMissingSnapshots();
 }
 
 $('#login-form').addEventListener('submit', async e => {
@@ -274,15 +276,76 @@ async function loadCachedSnapshots() {
   } catch {}
 }
 
-function renderResBars(snap) {
-  if (!snap) return '<span class="server-sub">未采集</span>';
-  if (!snap.online) return `<span class="badge danger" title="${escapeHtml(snap.error || '')}">离线</span>`;
-  const row = (label, pct) => {
+function fmtMemMb(mb) {
+  if (mb == null) return '—';
+  if (mb < 1024) return `${mb}M`;
+  const gb = mb / 1024;
+  return `${(gb >= 100 ? Math.round(gb) : gb.toFixed(1).replace(/\.0$/, ''))}G`;
+}
+
+function fmtDiskSize(mb, gbFallback) {
+  if (mb != null) {
+    if (mb >= 1048576) return `${(mb / 1048576).toFixed(1).replace(/\.0$/, '')}T`;
+    return fmtMemMb(mb);
+  }
+  return gbFallback != null ? `${gbFallback}G` : '—';
+}
+
+function renderResBars(snap, serverId) {
+  const isCollecting = collectingSnapshots.has(serverId);
+  if (!snap) {
+    return isCollecting
+      ? '<span class="badge blue">采集中…</span>'
+      : '<span class="server-sub">未采集</span>';
+  }
+  if (!snap.online) {
+    return isCollecting
+      ? '<span class="badge blue">采集中…</span>'
+      : `<span class="badge danger" title="${escapeHtml(snap.error || '')}">离线</span>`;
+  }
+  const row = (label, pct, spec) => {
     const v = pct == null ? '—' : `${Math.round(pct)}%`;
     const w = pct == null ? 0 : Math.min(100, Math.max(0, pct));
-    return `<div class="res-row"><span>${label}</span><div class="res-track"><div class="res-fill ${barClass(pct)}" style="width:${w}%"></div></div><span class="res-val">${v}</span></div>`;
+    return `<div class="res-row"><span>${label}</span><div class="res-track"><div class="res-fill ${barClass(pct)}" style="width:${w}%"></div></div><span class="res-val">${v}</span><span class="res-spec">${escapeHtml(spec)}</span></div>`;
   };
-  return `<div class="res-bars">${row('CPU', snap.cpuPercent)}${row('内存', snap.memPercent)}${row('磁盘', snap.diskPercent)}</div>`;
+  const cpuSpec = snap.cpuCores != null ? `${snap.cpuCores}核` : '—';
+  const memSpec = snap.memTotalMb ? `${fmtMemMb(snap.memUsedMb)} / ${fmtMemMb(snap.memTotalMb)}` : '—';
+  const diskSpec = (snap.diskTotalMb || snap.diskTotalGb)
+    ? `${fmtDiskSize(snap.diskUsedMb, snap.diskUsedGb)} / ${fmtDiskSize(snap.diskTotalMb, snap.diskTotalGb)}`
+    : '—';
+  const tip = `负载: ${snap.loadAverage || '—'} · 运行: ${snap.uptime || '—'} · 采集于 ${fmtDate(snap.checkedAt)}`;
+  return `<div class="res-bars${isCollecting ? ' refreshing' : ''}" title="${escapeHtml(tip)}">${row('CPU', snap.cpuPercent, cpuSpec)}${row('内存', snap.memPercent, memSpec)}${row('磁盘', snap.diskPercent, diskSpec)}</div>`;
+}
+
+async function collectSnapshots(ids, { silent = false } = {}) {
+  const queue = [...new Set(ids)].filter(id => id && !collectingSnapshots.has(id));
+  if (!queue.length) return;
+  queue.forEach(id => collectingSnapshots.add(id));
+  renderServers();
+  let done = 0;
+  const worker = async () => {
+    while (queue.length) {
+      const id = queue.shift();
+      try {
+        const s = await api(`/api/servers/${id}/snapshot`, { method: 'POST' });
+        snapshots.set(s.serverId, s);
+        done++;
+      } catch {
+      } finally {
+        collectingSnapshots.delete(id);
+        renderServers();
+        updateMetrics();
+        if (selected?.id === id) renderSnapshotTab();
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(4, Math.max(1, ids.length)) }, worker));
+  if (!silent) toast(`已刷新 ${done} 台主机状态`);
+}
+
+function collectMissingSnapshots() {
+  const missing = servers.filter(s => !snapshots.has(s.id)).map(s => s.id);
+  if (missing.length) collectSnapshots(missing, { silent: true });
 }
 
 function renderServers() {
@@ -316,7 +379,7 @@ function renderServers() {
           ${latency}
         </div>
       </td>
-      <td>${renderResBars(snap)}</td>
+      <td>${renderResBars(snap, s.id)}</td>
       <td>${(s.tags || '').split(',').filter(Boolean).map(t => `<span class="badge">${escapeHtml(t.trim())}</span>`).join('') || '<span class="server-sub">—</span>'}</td>
       <td>
         <div class="row-actions">
@@ -333,20 +396,18 @@ function renderServers() {
 }
 
 $('#search').oninput = renderServers;
-$('#refresh-servers').onclick = loadServers;
+$('#refresh-servers').onclick = async () => {
+  await Promise.all([loadServers(), loadCachedSnapshots()]);
+  collectMissingSnapshots();
+};
 $('#refresh-all-snapshots').onclick = async e => {
+  if (!servers.length) return toast('暂无可采集的服务器');
   const b = e.target;
   b.disabled = true;
   toast('正在并发采集全部主机状态…');
   try {
-    const list = await api('/api/servers/snapshots', { method: 'POST' });
-    snapshots.clear();
-    list.forEach(s => snapshots.set(s.serverId, s));
-    renderServers();
-    updateMetrics();
-    toast(`已刷新 ${list.length} 台主机状态`);
-  } catch (err) { toast(err.message); }
-  finally { b.disabled = false; }
+    await collectSnapshots(servers.map(s => s.id));
+  } finally { b.disabled = false; }
 };
 
 // --- Add / Edit Server Modal & Standalone SSH Key Management ---
@@ -644,11 +705,12 @@ $('#server-form').onsubmit = async e => {
     data.tryKeyboard = data.tryKeyboard === 'on';
     data.useServiceKey = data.useServiceKey === 'on';
     delete data.id;
-    await api('/api/servers' + (id ? '/' + id : ''), { method: id ? 'PUT' : 'POST', body: data });
+    const saved = await api('/api/servers' + (id ? '/' + id : ''), { method: id ? 'PUT' : 'POST', body: data });
     f.reset();
     $('#server-dialog').close();
     await Promise.all([loadServers(), loadSharedKeys()]);
     toast('服务器已保存');
+    if (saved?.id) collectSnapshots([saved.id], { silent: true });
   } catch (err) {
     $('#server-error').textContent = err.message;
   } finally { b.disabled = false; }
@@ -1264,8 +1326,8 @@ function renderSnapshotTab() {
   $('#snap-content').innerHTML = `
     <div class="snap-grid">
       ${gauge('CPU 使用率', s.cpuPercent, `${s.cpuCores ?? '?'} 核心 · 负载 ${s.loadAverage || '—'}`)}
-      ${gauge('内存使用率', s.memPercent, s.memTotalMb ? `${s.memUsedMb} MB / ${s.memTotalMb} MB` : '—')}
-      ${gauge('根分区磁盘', s.diskPercent, s.diskTotalGb ? `${s.diskUsedGb} GB / ${s.diskTotalGb} GB` : '—')}
+      ${gauge('内存使用率', s.memPercent, s.memTotalMb ? `${fmtMemMb(s.memUsedMb)} / ${fmtMemMb(s.memTotalMb)} (${s.memUsedMb} / ${s.memTotalMb} MB)` : '—')}
+      ${gauge('根分区磁盘', s.diskPercent, (s.diskTotalMb || s.diskTotalGb) ? `${fmtDiskSize(s.diskUsedMb, s.diskUsedGb)} / ${fmtDiskSize(s.diskTotalMb, s.diskTotalGb)}` : '—')}
     </div>
     <div class="snap-meta">
       <div><span>主机名</span><strong>${escapeHtml(s.hostname || '—')}</strong></div>
