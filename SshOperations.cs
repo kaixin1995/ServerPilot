@@ -616,7 +616,6 @@ public sealed class SshOperations : IDisposable
 
             _snapshots[server.View.Id] = snap;
             store.SaveSnapshot(snap);
-            store.Audit(actor, server.View.Name, "ssh.snapshot", "success", null, res.ExitCode, sw.ElapsedMilliseconds);
 
             if ((diskPct.HasValue && diskPct.Value >= 90) || (memPct.HasValue && memPct.Value >= 90))
                 notifications.Fire("alert", $"服务器资源告警：{server.View.Name}", $"内存：{memPct?.ToString("0.0") ?? "-"}%，磁盘：{diskPct?.ToString("0.0") ?? "-"}%");
@@ -630,7 +629,6 @@ public sealed class SshOperations : IDisposable
                 null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, Errors.Public(e));
             _snapshots[server.View.Id] = snap;
             store.SaveSnapshot(snap);
-            store.Audit(actor, server.View.Name, "ssh.snapshot", "failed", null, null, sw.ElapsedMilliseconds);
             notifications.Fire("alert", $"服务器离线告警：{server.View.Name}", $"主机 {server.View.Host}:{server.View.Port} 连接失败：{Errors.Public(e)}");
             return snap;
         }
