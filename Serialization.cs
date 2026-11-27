@@ -72,7 +72,10 @@ public sealed record ServerSnapshot(
     int? FailedServices,
     string? Error,
     long? DiskTotalMb = null,
-    long? DiskUsedMb = null);
+    long? DiskUsedMb = null,
+    long? SwapTotalMb = null,
+    long? SwapUsedMb = null,
+    double? SwapPercent = null);
 
 public sealed record BatchItemResult(string ServerId, string ServerName, bool Success, int? ExitCode, string? ExitSignal, string Stdout, string Stderr, bool OutputTruncated, long DurationMs, string? Error);
 public sealed record BatchExecuteResult(string Command, int Total, int Succeeded, int Failed, List<BatchItemResult> Results);

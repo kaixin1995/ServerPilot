@@ -1,6 +1,8 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Globalization;
+using System.Net;
+using System.Net.Sockets;
 using System.Text;
 using System.Text.RegularExpressions;
 using Renci.SshNet;
@@ -546,7 +548,12 @@ public sealed class SshOperations : IDisposable
             echo "LOAD=$(cat /proc/loadavg 2>/dev/null | awk '{print $1" "$2" "$3}' || uptime 2>/dev/null | awk -F'load average:' '{print $2}' | xargs)"
             echo "CPU=$(awk '/^cpu /{u=$2+$4; t=$2+$4+$5; if(t>0) printf "%.1f", (u*100)/t}' /proc/stat 2>/dev/null || echo '')"
             echo "MEM=$(free -m 2>/dev/null | awk '/^Mem:/{print $2" "$3}' || echo '')"
-            echo "DISK_KB=$((df -Pk / 2>/dev/null || df -k / 2>/dev/null) | awk 'NR==2{gsub(/%/,"",$5); print $2" "$3" "$5}' || echo '')"
+            echo "SWAP=$(free -m 2>/dev/null | awk '/^Swap:/{print $2" "$3}' || echo '')"
+            DISK_LINE=$(df -Pk / 2>/dev/null | awk 'NR==2{gsub(/%/,"",$5); print $2" "$3" "$5}')
+            if [ -z "$DISK_LINE" ]; then
+              DISK_LINE=$(df -k / 2>/dev/null | awk 'NR>1 && NF>=5 {gsub(/%/,"",$(NF-1)); print $(NF-4)" "$(NF-3)" "$(NF-1); exit}')
+            fi
+            echo "DISK_KB=$DISK_LINE"
             PORTS=$(ss -tlnH 2>/dev/null | awk '{print $4}' | sed 's/.*://' | sort -nu | tr '\n' ',' | sed 's/,$//' || true)
             echo "PORTS=$PORTS"
             if command -v docker >/dev/null 2>&1; then
@@ -561,8 +568,23 @@ public sealed class SshOperations : IDisposable
             """;
         try
         {
+            var canDirectTcp = string.IsNullOrWhiteSpace(server.View.Proxy) && string.IsNullOrWhiteSpace(server.View.JumpServerId);
+            var rttTask = canDirectTcp ? MeasureTcpRttAsync(server.View.Host, server.View.Port, ct) : Task.FromResult<long?>(null);
             var res = await ExecuteCoreAsync(server, probeScript, 20, ct);
             sw.Stop();
+            var rttMs = await rttTask;
+            if (rttMs is null && !canDirectTcp)
+            {
+                try
+                {
+                    var pingSw = Stopwatch.StartNew();
+                    await ExecuteCoreAsync(server, ":", 10, ct);
+                    pingSw.Stop();
+                    rttMs = Math.Max(1, pingSw.ElapsedMilliseconds);
+                }
+                catch { }
+            }
+            var latencyMs = rttMs ?? sw.ElapsedMilliseconds;
             var kv = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             foreach (var line in res.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries))
             {
@@ -577,6 +599,13 @@ public sealed class SshOperations : IDisposable
             if (memParts.Length >= 2 && long.TryParse(memParts[0], out var mt) && long.TryParse(memParts[1], out var mu) && mt > 0)
             {
                 memTotal = mt; memUsed = mu; memPct = Math.Round(mu * 100.0 / mt, 1);
+            }
+            long? swapTotal = null, swapUsed = null; double? swapPct = null;
+            var swapParts = (kv.GetValueOrDefault("SWAP") ?? "").Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            if (swapParts.Length >= 2 && long.TryParse(swapParts[0], out var st) && long.TryParse(swapParts[1], out var su) && st >= 0)
+            {
+                swapTotal = st; swapUsed = su;
+                swapPct = st > 0 ? Math.Round(su * 100.0 / st, 1) : null;
             }
             long? diskTotal = null, diskUsed = null, diskTotalMb = null, diskUsedMb = null; double? diskPct = null;
             var diskKbParts = (kv.GetValueOrDefault("DISK_KB") ?? "").Split(' ', StringSplitOptions.RemoveEmptyEntries);
@@ -608,11 +637,11 @@ public sealed class SshOperations : IDisposable
             int? failedSvc = int.TryParse(kv.GetValueOrDefault("FAILED_SVC"), out var fs) ? fs : null;
 
             var snap = new ServerSnapshot(
-                server.View.Id, server.View.Name, true, sw.ElapsedMilliseconds, DateTimeOffset.UtcNow.ToString("O"),
+                server.View.Id, server.View.Name, true, latencyMs, DateTimeOffset.UtcNow.ToString("O"),
                 kv.GetValueOrDefault("HOST"), kv.GetValueOrDefault("OS"), kv.GetValueOrDefault("KERNEL"), kv.GetValueOrDefault("UPTIME"),
                 cores, cpuPct, memTotal, memUsed, memPct, diskTotal, diskUsed, diskPct,
                 kv.GetValueOrDefault("LOAD"), portsList.Length, portsList.Length > 0 ? string.Join(", ", portsList.Take(20)) : "",
-                dockerRun, dockerTot, failedSvc, null, diskTotalMb, diskUsedMb);
+                dockerRun, dockerTot, failedSvc, null, diskTotalMb, diskUsedMb, swapTotal, swapUsed, swapPct);
 
             _snapshots[server.View.Id] = snap;
             store.SaveSnapshot(snap);
@@ -645,6 +674,31 @@ public sealed class SshOperations : IDisposable
             finally { sem.Release(); }
         });
         return (await Task.WhenAll(tasks)).OrderBy(s => s.ServerName, StringComparer.OrdinalIgnoreCase).ToList();
+    }
+
+    private static async Task<long?> MeasureTcpRttAsync(string host, int port, CancellationToken ct)
+    {
+        try
+        {
+            IPAddress addr;
+            if (!IPAddress.TryParse(host, out addr!))
+            {
+                var addrs = await Dns.GetHostAddressesAsync(host, ct);
+                if (addrs.Length == 0) return null;
+                addr = addrs.FirstOrDefault(a => a.AddressFamily == AddressFamily.InterNetwork) ?? addrs[0];
+            }
+            using var socket = new Socket(addr.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            timeoutCts.CancelAfter(TimeSpan.FromSeconds(5));
+            var sw = Stopwatch.StartNew();
+            await socket.ConnectAsync(new IPEndPoint(addr, port), timeoutCts.Token);
+            sw.Stop();
+            return Math.Max(1, sw.ElapsedMilliseconds);
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     // --- Batch Execute ---

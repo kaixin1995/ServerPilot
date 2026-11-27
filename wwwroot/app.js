@@ -310,11 +310,15 @@ function renderResBars(snap, serverId) {
   };
   const cpuSpec = snap.cpuCores != null ? `${snap.cpuCores}核` : '—';
   const memSpec = snap.memTotalMb ? `${fmtMemMb(snap.memUsedMb)} / ${fmtMemMb(snap.memTotalMb)}` : '—';
+  const swapSpec = snap.swapTotalMb == null
+    ? '—'
+    : (snap.swapTotalMb === 0 ? '未启用' : `${fmtMemMb(snap.swapUsedMb)} / ${fmtMemMb(snap.swapTotalMb)}`);
+  const swapPct = snap.swapTotalMb === 0 ? 0 : snap.swapPercent;
   const diskSpec = (snap.diskTotalMb || snap.diskTotalGb)
     ? `${fmtDiskSize(snap.diskUsedMb, snap.diskUsedGb)} / ${fmtDiskSize(snap.diskTotalMb, snap.diskTotalGb)}`
     : '—';
   const tip = `负载: ${snap.loadAverage || '—'} · 运行: ${snap.uptime || '—'} · 采集于 ${fmtDate(snap.checkedAt)}`;
-  return `<div class="res-bars${isCollecting ? ' refreshing' : ''}" title="${escapeHtml(tip)}">${row('CPU', snap.cpuPercent, cpuSpec)}${row('内存', snap.memPercent, memSpec)}${row('磁盘', snap.diskPercent, diskSpec)}</div>`;
+  return `<div class="res-bars${isCollecting ? ' refreshing' : ''}" title="${escapeHtml(tip)}">${row('CPU', snap.cpuPercent, cpuSpec)}${row('内存', snap.memPercent, memSpec)}${row('Swap', swapPct, swapSpec)}${row('磁盘', snap.diskPercent, diskSpec)}</div>`;
 }
 
 async function collectSnapshots(ids, { silent = false } = {}) {
@@ -359,7 +363,7 @@ function renderServers() {
     const dotCls = snap ? (snap.online ? 'online' : 'offline') : '';
     const jumpName = s.jumpServerId ? byId.get(s.jumpServerId) : null;
     const sharedKeyName = s.sharedKeyId ? keyById.get(s.sharedKeyId) : null;
-    const latency = snap?.online ? `<span class="badge blue">${snap.latencyMs}ms</span>` : '';
+    const latency = snap?.online ? `<span class="badge blue" title="网络延迟 (TCP RTT)">${snap.latencyMs}ms</span>` : '';
     return `<tr>
       <td>
         <div class="server-cell">
@@ -1309,7 +1313,7 @@ function renderSnapshotTab() {
     $('#snap-content').innerHTML = '<div class="empty"><p>点击右上角“立即采集状态”获取 CPU、内存、磁盘、监听端口与服务信息。</p></div>';
     return;
   }
-  $('#snap-checked-at').textContent = `采集时间：${fmtDate(s.checkedAt)} · 延迟 ${s.latencyMs}ms`;
+  $('#snap-checked-at').textContent = `采集时间：${fmtDate(s.checkedAt)} · 网络延迟 ${s.latencyMs}ms`;
   if (!s.online) {
     $('#snap-content').innerHTML = `<div class="empty"><strong style="color:var(--danger)">主机离线或连接失败</strong><p>${escapeHtml(s.error || '')}</p></div>`;
     return;
@@ -1323,10 +1327,15 @@ function renderSnapshotTab() {
       <div class="footnote" style="margin:0">${escapeHtml(sub)}</div>
     </div>`;
   };
+  const swapCardPct = s.swapTotalMb === 0 ? 0 : s.swapPercent;
+  const swapCardSub = s.swapTotalMb == null
+    ? '—'
+    : (s.swapTotalMb === 0 ? '未启用 Swap' : `${fmtMemMb(s.swapUsedMb)} / ${fmtMemMb(s.swapTotalMb)} (${s.swapUsedMb} / ${s.swapTotalMb} MB)`);
   $('#snap-content').innerHTML = `
     <div class="snap-grid">
       ${gauge('CPU 使用率', s.cpuPercent, `${s.cpuCores ?? '?'} 核心 · 负载 ${s.loadAverage || '—'}`)}
       ${gauge('内存使用率', s.memPercent, s.memTotalMb ? `${fmtMemMb(s.memUsedMb)} / ${fmtMemMb(s.memTotalMb)} (${s.memUsedMb} / ${s.memTotalMb} MB)` : '—')}
+      ${gauge('Swap 交换分区', swapCardPct, swapCardSub)}
       ${gauge('根分区磁盘', s.diskPercent, (s.diskTotalMb || s.diskTotalGb) ? `${fmtDiskSize(s.diskUsedMb, s.diskUsedGb)} / ${fmtDiskSize(s.diskTotalMb, s.diskTotalGb)}` : '—')}
     </div>
     <div class="snap-meta">
