@@ -22,7 +22,7 @@ public sealed record ProbeInput(string Host, int Port);
 public sealed record JobInput(string Command, int TimeoutSeconds = 600);
 public sealed record ReadFileInput(string RemotePath, long Offset = 0, int Length = 65536);
 public sealed record WriteFileInput(string RemotePath, string Content, bool Append = false, int? Mode = null);
-public sealed record PatchFileInput(string RemotePath, string OldText, string NewText, bool ReplaceAll = false);
+public sealed record PatchFileInput(string RemotePath, string OldText, string NewText, bool ReplaceAll = false, string? ExpectedSha256 = null);
 public sealed record RemotePathInput(string RemotePath);
 public sealed record RenameRemoteInput(string OldPath, string NewPath);
 public sealed record JobCleanupInput(int OlderThanHours = 24);
@@ -45,6 +45,16 @@ public sealed record JobListItem(string JobId, string State, int? ExitCode, stri
 public sealed record JobListResult(string Server, List<JobListItem> Jobs);
 public sealed record JobKillResult(bool Killed, string JobId, string Server, string Message);
 public sealed record JobCleanupResult(string Server, int Removed, string Message);
+
+public sealed record DiskMountInfo(string MountPoint, string Filesystem, long TotalMb, long UsedMb, long AvailMb, double Percent);
+
+public sealed record TailLogResult(string Server, string Path, int RequestedLines, int ReturnedLines, long FileSize, string Content, bool Truncated);
+public sealed record DockerContainerInfo(string Id, string Name, string Image, string State, string Status, string Ports);
+public sealed record DockerStatusResult(string Server, bool Available, int Running, int Total, List<DockerContainerInfo> Containers, string? Message = null);
+public sealed record DockerLogsResult(string Server, string Container, int Lines, string Output, bool Truncated);
+public sealed record ServiceUnitInfo(string Unit, string Load, string Active, string Sub, string Description);
+public sealed record ServiceStatusResult(string Server, bool Available, int FailedCount, List<ServiceUnitInfo> Units, string? Message = null);
+public sealed record ServiceLogsResult(string Server, string Unit, int Lines, string Output, bool Truncated);
 
 public sealed record ServerSnapshot(
     string ServerId,
@@ -75,7 +85,13 @@ public sealed record ServerSnapshot(
     long? DiskUsedMb = null,
     long? SwapTotalMb = null,
     long? SwapUsedMb = null,
-    double? SwapPercent = null);
+    double? SwapPercent = null,
+    List<DiskMountInfo>? Disks = null,
+    long? NetRxBytesPerSec = null,
+    long? NetTxBytesPerSec = null,
+    long? NetRxTotalBytes = null,
+    long? NetTxTotalBytes = null,
+    string? NetTrafficSource = null);
 
 public sealed record BatchItemResult(string ServerId, string ServerName, bool Success, int? ExitCode, string? ExitSignal, string Stdout, string Stderr, bool OutputTruncated, long DurationMs, string? Error);
 public sealed record BatchExecuteResult(string Command, int Total, int Succeeded, int Failed, List<BatchItemResult> Results);
@@ -247,6 +263,17 @@ internal sealed partial class StorageJsonContext : JsonSerializerContext;
 [JsonSerializable(typeof(JobCleanupResult))]
 [JsonSerializable(typeof(ServerSnapshot))]
 [JsonSerializable(typeof(List<ServerSnapshot>))]
+[JsonSerializable(typeof(DiskMountInfo))]
+[JsonSerializable(typeof(List<DiskMountInfo>))]
+[JsonSerializable(typeof(TailLogResult))]
+[JsonSerializable(typeof(DockerContainerInfo))]
+[JsonSerializable(typeof(List<DockerContainerInfo>))]
+[JsonSerializable(typeof(DockerStatusResult))]
+[JsonSerializable(typeof(DockerLogsResult))]
+[JsonSerializable(typeof(ServiceUnitInfo))]
+[JsonSerializable(typeof(List<ServiceUnitInfo>))]
+[JsonSerializable(typeof(ServiceStatusResult))]
+[JsonSerializable(typeof(ServiceLogsResult))]
 [JsonSerializable(typeof(BatchItemResult))]
 [JsonSerializable(typeof(BatchExecuteResult))]
 [JsonSerializable(typeof(ParsedSshHost))]

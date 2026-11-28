@@ -57,9 +57,29 @@ public sealed class SshTools
     public static Task<ConnectionTestResult> TestConnection(ServerStore store, SshOperations ssh, [Description("Server ID or name from list_servers")] string server)
         => Guard(() => { var s = RequireServer(store, server); return ssh.Test(s.Id, Auth.Actor); });
 
-    [McpServerTool(Name = "server_snapshot", ReadOnly = true), Description("Collect structured health metrics for a server: OS, kernel, uptime, CPU, memory, disk, load average, listening TCP ports, Docker and failed systemd services.")]
+    [McpServerTool(Name = "server_snapshot", ReadOnly = true), Description("Collect structured health metrics for a server: OS, kernel, uptime, CPU, memory, swap, multi-mount disks, real-time network speed/traffic, load average, listening TCP ports, Docker and failed systemd services.")]
     public static Task<ServerSnapshot> ServerSnapshot(ServerStore store, SshOperations ssh, [Description("Server ID or name")] string server, CancellationToken cancellationToken = default)
         => Guard(() => { var s = RequireServer(store, server); return ssh.GetSnapshot(s.Id, Auth.Actor, cancellationToken); });
+
+    [McpServerTool(Name = "tail_log", ReadOnly = true), Description("Read the last N lines of a remote UTF-8 text log file over SFTP (respects allowedRemotePaths). Safe for read-only inspection.")]
+    public static Task<TailLogResult> TailLog(ServerStore store, SshOperations ssh, [Description("Server ID or name")] string server, [Description("Absolute path to the remote log file")] string remotePath, [Description("Number of trailing lines, 1 to 2000")] int lines = 100)
+        => Guard(() => { var s = RequireServer(store, server); return ssh.TailLog(s.Id, remotePath, lines, Auth.Actor); });
+
+    [McpServerTool(Name = "docker_status", ReadOnly = true), Description("List Docker containers (id, name, image, state, status, ports) in structured form without shell injection.")]
+    public static Task<DockerStatusResult> DockerStatus(ServerStore store, SshOperations ssh, [Description("Server ID or name")] string server, [Description("Include stopped containers")] bool includeStopped = true, [Description("Optional container name filter")] string? filterName = null, CancellationToken cancellationToken = default)
+        => Guard(() => { var s = RequireServer(store, server); return ssh.GetDockerStatus(s.Id, includeStopped, filterName, Auth.Actor, cancellationToken); });
+
+    [McpServerTool(Name = "docker_logs", ReadOnly = true), Description("Fetch trailing logs of a specific Docker container without arbitrary shell execution.")]
+    public static Task<DockerLogsResult> DockerLogs(ServerStore store, SshOperations ssh, [Description("Server ID or name")] string server, [Description("Container name or ID")] string container, [Description("Trailing lines, 1 to 2000")] int lines = 100, [Description("Optional relative duration like 10m, 2h, 1d")] string? since = null, CancellationToken cancellationToken = default)
+        => Guard(() => { var s = RequireServer(store, server); return ssh.GetDockerLogs(s.Id, container, lines, since, Auth.Actor, cancellationToken); });
+
+    [McpServerTool(Name = "service_status", ReadOnly = true), Description("List systemd service units (or inspect a specific unit) in structured form.")]
+    public static Task<ServiceStatusResult> ServiceStatus(ServerStore store, SshOperations ssh, [Description("Server ID or name")] string server, [Description("Only return failed units when unit is omitted")] bool failedOnly = false, [Description("Optional specific systemd unit name, e.g. nginx or nginx.service")] string? unit = null, CancellationToken cancellationToken = default)
+        => Guard(() => { var s = RequireServer(store, server); return ssh.GetServiceStatus(s.Id, failedOnly, unit, Auth.Actor, cancellationToken); });
+
+    [McpServerTool(Name = "service_logs", ReadOnly = true), Description("Read recent journalctl logs for a specific systemd service unit.")]
+    public static Task<ServiceLogsResult> ServiceLogs(ServerStore store, SshOperations ssh, [Description("Server ID or name")] string server, [Description("Systemd unit name, e.g. nginx or sshd")] string unit, [Description("Trailing lines, 1 to 2000")] int lines = 100, [Description("Optional relative duration like 30m, 2h, 1d")] string? since = null, CancellationToken cancellationToken = default)
+        => Guard(() => { var s = RequireServer(store, server); return ssh.GetServiceLogs(s.Id, unit, lines, since, Auth.Actor, cancellationToken); });
 
     [McpServerTool(Name = "execute_command"), Description("Execute a non-interactive SSH command. Returns exit code, stdout and stderr. Maximum timeout is 1800 seconds.")]
     public static Task<CommandResult> ExecuteCommand(ServerStore store, SshOperations ssh, [Description("Server ID or name")] string server, [Description("Remote shell command")] string command, [Description("Timeout in seconds, 1 to 1800")] int timeoutSeconds = 60, CancellationToken cancellationToken = default)
@@ -137,10 +157,10 @@ public sealed class SshTools
         [Description("Text content")] string content, [Description("Append instead of overwrite")] bool append = false, [Description("Optional POSIX mode for a newly created file, e.g. 420 for 0644")] int? mode = null)
         => Guard(() => { RequireWrite(); var s = RequireServer(store, server); return ssh.WriteFile(s.Id, remotePath, content, append, mode, Auth.Actor); });
 
-    [McpServerTool(Name = "patch_file"), Description("Replace exact text inside a remote UTF-8 text file over SFTP without rewriting the entire file. Fails if oldText is not found or matches multiple locations unless replaceAll=true.")]
+    [McpServerTool(Name = "patch_file"), Description("Replace exact text inside a remote UTF-8 text file over SFTP without rewriting the entire file. Fails if oldText is not found, matches multiple locations unless replaceAll=true, or expectedSha256 mismatches.")]
     public static Task<PatchFileResult> PatchFile(ServerStore store, SshOperations ssh, [Description("Server ID or name")] string server, [Description("Absolute path on the SSH server")] string remotePath,
-        [Description("Exact existing text to replace")] string oldText, [Description("Replacement text")] string newText, [Description("Replace all occurrences instead of requiring a unique match")] bool replaceAll = false)
-        => Guard(() => { RequireWrite(); var s = RequireServer(store, server); return ssh.PatchFile(s.Id, remotePath, oldText, newText, replaceAll, Auth.Actor); });
+        [Description("Exact existing text to replace")] string oldText, [Description("Replacement text")] string newText, [Description("Replace all occurrences instead of requiring a unique match")] bool replaceAll = false, [Description("Optional SHA-256 hex from read_file to guard against concurrent edits")] string? expectedSha256 = null)
+        => Guard(() => { RequireWrite(); var s = RequireServer(store, server); return ssh.PatchFile(s.Id, remotePath, oldText, newText, replaceAll, Auth.Actor, expectedSha256); });
 
     private static async Task<T> Guard<T>(Func<Task<T>> call) { try { return await call(); } catch (McpException) { throw; } catch (Exception e) { throw new McpException(Errors.Public(e)); } }
     private static T GuardSync<T>(Func<T> call) { try { return call(); } catch (McpException) { throw; } catch (Exception e) { throw new McpException(Errors.Public(e)); } }

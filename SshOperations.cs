@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.Net;
 using System.Net.Sockets;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
 using Renci.SshNet;
@@ -12,7 +13,7 @@ using Renci.SshNet.Sftp;
 namespace ServerPilot;
 
 public sealed record CommandResult(int? ExitCode, string? ExitSignal, string Stdout, string Stderr, bool OutputTruncated);
-public sealed record TextReadResult(string Content, long Size, long Offset, long BytesRead, long? NextOffset, bool IsBinary);
+public sealed record TextReadResult(string Content, long Size, long Offset, long BytesRead, long? NextOffset, bool IsBinary, string? Sha256 = null);
 
 public sealed class TerminalSession : IDisposable
 {
@@ -559,6 +560,37 @@ public sealed class SshOperations : IDisposable
               DISK_LINE=$(df -k / 2>/dev/null | awk 'NR>1 && NF>=5 {gsub(/%/,"",$(NF-1)); print $(NF-4)" "$(NF-3)" "$(NF-1); exit}')
             fi
             echo "DISK_KB=$DISK_LINE"
+            (df -PkT 2>/dev/null || df -Pk 2>/dev/null) | awk '
+              NR>1 && NF>=6 {
+                if (NF>=7) { fs=$1; type=$2; tot=$3; used=$4; avail=$5; mp=$7; for(i=8;i<=NF;i++) mp=mp" "$i }
+                else { fs=$1; type=""; tot=$2; used=$3; avail=$4; mp=$6; for(i=7;i<=NF;i++) mp=mp" "$i }
+                if (type ~ /^(tmpfs|devtmpfs|squashfs|overlay|proc|sysfs|cgroup|cgroup2|devpts|mqueue|hugetlbfs|autofs|fusectl|securityfs|pstore|efivarfs|debugfs|tracefs|ramfs|rpc_pipefs|nsfs)$/) next
+                if (fs ~ /^(tmpfs|devtmpfs|udev|none|overlay)$/) next
+                if (mp ~ /^\/(dev|proc|sys|run|snap)(\/|$)/ || mp ~ /\/(docker|containerd)\/(overlay2|aufs|containers|image|volumes)\// || mp == "/boot/efi") next
+                if (tot+0 <= 0) next
+                print "DISK_MOUNT=" mp "\t" fs "\t" tot "\t" used "\t" avail
+              }'
+            net_sum() {
+              awk -F':' 'NR>2 && NF==2 {
+                iface=$1; gsub(/^[ \t]+|[ \t]+$/,"",iface);
+                if (iface=="" || iface=="lo" || iface ~ /^(veth|docker|br-|virbr|cni|flannel|cali|kube)/) next;
+                val=$2; sub(/^[ \t]+/,"",val);
+                n=split(val, f, /[ \t]+/);
+                if (n>=9) { rx += f[1]; tx += f[9] }
+              } END { printf "%.0f %.0f", rx, tx }' /proc/net/dev 2>/dev/null
+            }
+            if [ -r /proc/net/dev ]; then
+              T1=$(date +%s%N 2>/dev/null || echo "")
+              N1=$(net_sum)
+              if sleep 0.4 2>/dev/null; then SL=400; else sleep 1; SL=1000; fi
+              T2=$(date +%s%N 2>/dev/null || echo "")
+              N2=$(net_sum)
+              echo "NET1=$N1"
+              echo "NET2=$N2"
+              echo "NET_T1=$T1"
+              echo "NET_T2=$T2"
+              echo "NET_SL=$SL"
+            fi
             PORTS=$(ss -tlnH 2>/dev/null | awk '{print $4}' | sed 's/.*://' | sort -nu | tr '\n' ',' | sed 's/,$//' || true)
             echo "PORTS=$PORTS"
             if command -v docker >/dev/null 2>&1; then
@@ -591,10 +623,32 @@ public sealed class SshOperations : IDisposable
             }
             var latencyMs = rttMs ?? sw.ElapsedMilliseconds;
             var kv = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            var rawMounts = new List<(string MountPoint, string Filesystem, long TotalKb, long UsedKb, long AvailKb)>();
             foreach (var line in res.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries))
             {
+                if (line.StartsWith("DISK_MOUNT=", StringComparison.OrdinalIgnoreCase))
+                {
+                    var parts = line[11..].Split('\t');
+                    if (parts.Length >= 5 && long.TryParse(parts[2], out var tKb) && long.TryParse(parts[3], out var uKb) && long.TryParse(parts[4], out var aKb) && tKb > 0)
+                        rawMounts.Add((parts[0].Trim(), parts[1].Trim(), tKb, uKb, aKb));
+                    continue;
+                }
                 var ix = line.IndexOf('=');
                 if (ix > 0) kv[line[..ix].Trim()] = line[(ix + 1)..].Trim();
+            }
+
+            // Deduplicate shared block devices (e.g. btrfs subvolumes/bind mounts), keeping "/" first
+            var diskMounts = new List<DiskMountInfo>();
+            var seenFs = new HashSet<string>(StringComparer.Ordinal);
+            var seenMp = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var m in rawMounts.OrderByDescending(x => x.MountPoint == "/").ThenBy(x => x.MountPoint, StringComparer.Ordinal))
+            {
+                if (!seenMp.Add(m.MountPoint)) continue;
+                if (!string.IsNullOrEmpty(m.Filesystem) && m.Filesystem.StartsWith('/') && !seenFs.Add(m.Filesystem)) continue;
+                diskMounts.Add(new DiskMountInfo(
+                    m.MountPoint, m.Filesystem,
+                    m.TotalKb / 1024, m.UsedKb / 1024, m.AvailKb / 1024,
+                    Math.Round(m.UsedKb * 100.0 / m.TotalKb, 1)));
             }
 
             int? cores = int.TryParse(kv.GetValueOrDefault("CORES"), out var cVal) ? cVal : null;
@@ -645,12 +699,37 @@ public sealed class SshOperations : IDisposable
             }
             int? failedSvc = int.TryParse(kv.GetValueOrDefault("FAILED_SVC"), out var fs) ? fs : null;
 
+            long? netRxRate = null, netTxRate = null, netRxTotal = null, netTxTotal = null;
+            string? netSource = null;
+            var n1 = (kv.GetValueOrDefault("NET1") ?? "").Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            var n2 = (kv.GetValueOrDefault("NET2") ?? "").Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            if (n1.Length >= 2 && n2.Length >= 2 &&
+                long.TryParse(n1[0], out var rx1) && long.TryParse(n1[1], out var tx1) &&
+                long.TryParse(n2[0], out var rx2) && long.TryParse(n2[1], out var tx2))
+            {
+                double dtMs = double.TryParse(kv.GetValueOrDefault("NET_SL"), out var sl) && sl > 0 ? sl : 400.0;
+                if (long.TryParse(kv.GetValueOrDefault("NET_T1"), out var t1) &&
+                    long.TryParse(kv.GetValueOrDefault("NET_T2"), out var t2) && t2 > t1)
+                {
+                    dtMs = (t2 - t1) / 1_000_000.0;
+                }
+                if (dtMs > 10)
+                {
+                    netRxRate = Math.Max(0, (long)Math.Round((rx2 - rx1) * 1000.0 / dtMs));
+                    netTxRate = Math.Max(0, (long)Math.Round((tx2 - tx1) * 1000.0 / dtMs));
+                }
+                netRxTotal = rx2;
+                netTxTotal = tx2;
+                netSource = "boot";
+            }
+
             var snap = new ServerSnapshot(
                 server.View.Id, server.View.Name, true, latencyMs, DateTimeOffset.UtcNow.ToString("O"),
                 kv.GetValueOrDefault("HOST"), kv.GetValueOrDefault("OS"), kv.GetValueOrDefault("KERNEL"), kv.GetValueOrDefault("UPTIME"),
                 cores, cpuPct, memTotal, memUsed, memPct, diskTotal, diskUsed, diskPct,
                 kv.GetValueOrDefault("LOAD"), portsList.Length, portsList.Length > 0 ? string.Join(", ", portsList.Take(20)) : "",
-                dockerRun, dockerTot, failedSvc, null, diskTotalMb, diskUsedMb, swapTotal, swapUsed, swapPct);
+                dockerRun, dockerTot, failedSvc, null, diskTotalMb, diskUsedMb, swapTotal, swapUsed, swapPct,
+                diskMounts.Count > 0 ? diskMounts : null, netRxRate, netTxRate, netRxTotal, netTxTotal, netSource);
 
             _snapshots[server.View.Id] = snap;
             store.SaveSnapshot(snap);
@@ -1106,9 +1185,151 @@ public sealed class SshOperations : IDisposable
             var text = binary ? "" : Encoding.UTF8.GetString(data, 0, consumed);
             if (!binary && consumed == 0 && data.Length > 0) throw new ArgumentException("读取长度不足以容纳一个 UTF-8 字符，请增大读取长度。");
             long? next = offset + consumed < attr.Size ? offset + consumed : null;
-            return new TextReadResult(text, attr.Size, offset, consumed, next, binary);
+            string? sha256 = !binary && offset == 0 && next is null ? Convert.ToHexString(SHA256.HashData(data)).ToLowerInvariant() : null;
+            return new TextReadResult(text, attr.Size, offset, consumed, next, binary, sha256);
         })), remotePath);
     }
+
+    public Task<TailLogResult> TailLog(string id, string remotePath, int lines, string actor)
+    {
+        RemotePath(remotePath);
+        if (lines is < 1 or > 2000) throw new ArgumentException("lines 应在 1–2000 之间。");
+        return Logged(id, actor, "sftp.tail_log", s => Task.Run(() => WithSftp(s, sftp =>
+        {
+            AllowedRemotePath(sftp, s.View, remotePath);
+            var attr = sftp.GetAttributes(remotePath);
+            if (!attr.IsRegularFile) throw new ArgumentException("仅支持读取普通文本日志文件。");
+            const int maxTailBytes = 512 * 1024;
+            var offset = Math.Max(0, attr.Size - maxTailBytes);
+            var want = (int)(attr.Size - offset);
+            var truncatedByBytes = offset > 0;
+            var buffer = new byte[want];
+            var read = 0;
+            using (var stream = sftp.OpenRead(remotePath))
+            {
+                if (offset > 0) stream.Seek(offset, SeekOrigin.Begin);
+                while (read < want)
+                {
+                    var n = stream.Read(buffer, read, want - read);
+                    if (n <= 0) break;
+                    read += n;
+                }
+            }
+            var span = buffer.AsSpan(0, read);
+            if (span.Contains((byte)0)) throw new ArgumentException("检测到二进制文件，拒绝按文本读取日志。");
+            var startIx = 0;
+            if (truncatedByBytes)
+            {
+                while (startIx < span.Length && (span[startIx] & 0xC0) == 0x80) startIx++;
+                var nl = span[startIx..].IndexOf((byte)'\n');
+                if (nl >= 0) startIx += nl + 1;
+            }
+            var text = Encoding.UTF8.GetString(span[startIx..]);
+            var allLines = text.Replace("\r\n", "\n", StringComparison.Ordinal).Split('\n');
+            var count = allLines.Length;
+            if (count > 0 && allLines[^1] == "") count--;
+            var skip = Math.Max(0, count - lines);
+            var resultLines = allLines.Skip(skip).Take(count - skip).ToArray();
+            var content = string.Join('\n', resultLines);
+            return new TailLogResult(s.View.Name, remotePath, lines, resultLines.Length, attr.Size, content, truncatedByBytes && skip == 0);
+        })), remotePath);
+    }
+
+    public async Task<DockerStatusResult> GetDockerStatus(string id, bool includeStopped, string? filterName, string actor, CancellationToken ct = default)
+    {
+        if (!string.IsNullOrWhiteSpace(filterName) && !Regex.IsMatch(filterName.Trim(), @"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$"))
+            throw new ArgumentException("容器过滤名称无效。");
+        var args = new StringBuilder("if ! command -v docker >/dev/null 2>&1; then echo '__NO_DOCKER__'; exit 0; fi; docker ps");
+        if (includeStopped) args.Append(" -a");
+        if (!string.IsNullOrWhiteSpace(filterName)) args.Append(" --filter ").Append(ShellQuote("name=" + filterName.Trim()));
+        args.Append(" --format '{{.ID}}\\t{{.Names}}\\t{{.Image}}\\t{{.State}}\\t{{.Status}}\\t{{.Ports}}'");
+        var res = await Logged(id, actor, "docker.status", s => ExecuteCoreAsync(s, args.ToString(), 20, ct), filterName);
+        if (res.Stdout.Contains("__NO_DOCKER__", StringComparison.Ordinal))
+            return new DockerStatusResult(store.Get(id).View.Name, false, 0, 0, [], "远端主机未安装 Docker。");
+        if (res.ExitCode != 0)
+            throw new InvalidOperationException(string.IsNullOrWhiteSpace(res.Stderr) ? "查询 Docker 容器失败。" : res.Stderr.Trim());
+        var list = new List<DockerContainerInfo>();
+        foreach (var line in res.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var p = line.TrimEnd('\r').Split('\t');
+            if (p.Length < 5) continue;
+            list.Add(new DockerContainerInfo(p[0], p[1], p[2], p[3], p[4], p.Length >= 6 ? p[5] : ""));
+        }
+        var running = list.Count(c => string.Equals(c.State, "running", StringComparison.OrdinalIgnoreCase));
+        return new DockerStatusResult(store.Get(id).View.Name, true, running, list.Count, list);
+    }
+
+    public async Task<DockerLogsResult> GetDockerLogs(string id, string container, int lines, string? since, string actor, CancellationToken ct = default)
+    {
+        var cName = (container ?? "").Trim();
+        if (!Regex.IsMatch(cName, @"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$"))
+            throw new ArgumentException("容器名称或 ID 格式无效。");
+        if (lines is < 1 or > 2000) throw new ArgumentException("lines 应在 1–2000 之间。");
+        var sinceClause = "";
+        if (!string.IsNullOrWhiteSpace(since))
+        {
+            var sVal = since.Trim();
+            if (!Regex.IsMatch(sVal, @"^[0-9]{1,6}[smhd]$")) throw new ArgumentException("since 格式无效，例如 10m、2h、1d。");
+            sinceClause = " --since " + ShellQuote(sVal);
+        }
+        var cmd = $"docker logs --tail {lines}{sinceClause} -- {ShellQuote(cName)} 2>&1";
+        var res = await Logged(id, actor, "docker.logs", s => ExecuteCoreAsync(s, cmd, 30, ct), cName, r => r.ExitCode);
+        if (res.ExitCode != 0)
+            throw new InvalidOperationException(string.IsNullOrWhiteSpace(res.Stdout) ? "读取容器日志失败。" : res.Stdout.Trim());
+        return new DockerLogsResult(store.Get(id).View.Name, cName, lines, res.Stdout, res.OutputTruncated);
+    }
+
+    public async Task<ServiceStatusResult> GetServiceStatus(string id, bool failedOnly, string? unit, string actor, CancellationToken ct = default)
+    {
+        string? cleanUnit = null;
+        if (!string.IsNullOrWhiteSpace(unit))
+        {
+            cleanUnit = unit.Trim();
+            if (!Regex.IsMatch(cleanUnit, @"^[a-zA-Z0-9@._:-]{1,128}$"))
+                throw new ArgumentException("服务单元名称格式无效。");
+        }
+        var sb = new StringBuilder("if ! command -v systemctl >/dev/null 2>&1; then echo '__NO_SYSTEMD__'; exit 0; fi; systemctl list-units --type=service --all --no-pager --no-legend");
+        if (failedOnly && cleanUnit is null) sb.Append(" --state=failed");
+        if (cleanUnit is not null) sb.Append(" -- ").Append(ShellQuote(cleanUnit.EndsWith(".service", StringComparison.OrdinalIgnoreCase) ? cleanUnit : cleanUnit + ".service"));
+        var res = await Logged(id, actor, "service.status", s => ExecuteCoreAsync(s, sb.ToString(), 20, ct), cleanUnit ?? (failedOnly ? "failed" : "all"));
+        if (res.Stdout.Contains("__NO_SYSTEMD__", StringComparison.Ordinal))
+            return new ServiceStatusResult(store.Get(id).View.Name, false, 0, [], "远端主机不支持 systemd。");
+        var units = new List<ServiceUnitInfo>();
+        foreach (var rawLine in res.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var line = rawLine.Trim();
+            if (line.StartsWith("●", StringComparison.Ordinal)) line = line[1..].TrimStart();
+            var parts = Regex.Split(line, @"\s+", RegexOptions.None, TimeSpan.FromSeconds(1));
+            if (parts.Length < 4) continue;
+            var desc = parts.Length > 4 ? string.Join(' ', parts.Skip(4)) : "";
+            units.Add(new ServiceUnitInfo(parts[0], parts[1], parts[2], parts[3], desc));
+        }
+        var failed = units.Count(u => string.Equals(u.Active, "failed", StringComparison.OrdinalIgnoreCase));
+        return new ServiceStatusResult(store.Get(id).View.Name, true, failed, units);
+    }
+
+    public async Task<ServiceLogsResult> GetServiceLogs(string id, string unit, int lines, string? since, string actor, CancellationToken ct = default)
+    {
+        var cleanUnit = (unit ?? "").Trim();
+        if (!Regex.IsMatch(cleanUnit, @"^[a-zA-Z0-9@._:-]{1,128}$"))
+            throw new ArgumentException("服务单元名称格式无效。");
+        if (lines is < 1 or > 2000) throw new ArgumentException("lines 应在 1–2000 之间。");
+        var sinceArg = "";
+        if (!string.IsNullOrWhiteSpace(since))
+        {
+            var m = Regex.Match(since.Trim(), @"^([0-9]{1,6})([smhd])$");
+            if (!m.Success) throw new ArgumentException("since 格式无效，例如 30m、2h、1d。");
+            var word = m.Groups[2].Value switch { "s" => "seconds", "m" => "minutes", "h" => "hours", _ => "days" };
+            sinceArg = " --since " + ShellQuote($"{m.Groups[1].Value} {word} ago");
+        }
+        var cmd = $"journalctl -u {ShellQuote(cleanUnit)} -n {lines}{sinceArg} --no-pager 2>&1";
+        var res = await Logged(id, actor, "service.logs", s => ExecuteCoreAsync(s, cmd, 30, ct), cleanUnit, r => r.ExitCode);
+        if (res.ExitCode != 0)
+            throw new InvalidOperationException(string.IsNullOrWhiteSpace(res.Stdout) ? "读取服务日志失败。" : res.Stdout.Trim());
+        return new ServiceLogsResult(store.Get(id).View.Name, cleanUnit, lines, res.Stdout, res.OutputTruncated);
+    }
+
+    private static string ShellQuote(string s) => "'" + s.Replace("'", "'\"'\"'", StringComparison.Ordinal) + "'";
 
     public Task<WriteFileResult> WriteFile(string id, string remotePath, string content, bool append, int? mode, string actor)
     {
@@ -1128,10 +1349,12 @@ public sealed class SshOperations : IDisposable
         })), remotePath);
     }
 
-    public Task<PatchFileResult> PatchFile(string id, string remotePath, string oldText, string newText, bool replaceAll, string actor)
+    public Task<PatchFileResult> PatchFile(string id, string remotePath, string oldText, string newText, bool replaceAll, string actor, string? expectedSha256 = null)
     {
         RemotePath(remotePath);
         if (string.IsNullOrEmpty(oldText)) throw new ArgumentException("oldText 不能为空。");
+        if (!string.IsNullOrWhiteSpace(expectedSha256) && !Regex.IsMatch(expectedSha256.Trim(), @"^[0-9a-fA-F]{64}$"))
+            throw new ArgumentException("expectedSha256 必须是 64 位十六进制 SHA-256。");
         return Logged(id, actor, "sftp.patch_file", s => Task.Run(() => WithSftp(s, sftp =>
         {
             AllowedRemotePath(sftp, s.View, remotePath);
@@ -1144,6 +1367,12 @@ public sealed class SshOperations : IDisposable
                 using var rs = sftp.OpenRead(remotePath);
                 rs.CopyTo(ms);
                 raw = ms.ToArray();
+            }
+            if (!string.IsNullOrWhiteSpace(expectedSha256))
+            {
+                var actualHash = Convert.ToHexString(SHA256.HashData(raw)).ToLowerInvariant();
+                if (!string.Equals(actualHash, expectedSha256.Trim(), StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidOperationException($"文件已被其他操作修改（期望 SHA-256 {expectedSha256.Trim()[..12]}…，实际 {actualHash[..12]}…），请重新读取后再试。");
             }
             if (raw.Any(b => b == 0)) throw new ArgumentException("检测到二进制文件，拒绝文本替换。");
             var content = Encoding.UTF8.GetString(raw);

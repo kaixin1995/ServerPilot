@@ -50,6 +50,9 @@ let servers = [];
 let sharedKeys = [];
 let snapshots = new Map();
 const collectingSnapshots = new Set();
+let serverViewMode = localStorage.getItem('sp_view_mode') === 'table' ? 'table' : 'cards';
+let currentView = 'servers';
+let probeTimer = null;
 let snippets = [];
 let tokens = [];
 let selected = null;
@@ -78,7 +81,41 @@ function fmtBytes(n) {
   if (n < 1024) return `${n} B`;
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
   if (n < 1024 * 1024 * 1024) return `${(n / 1048576).toFixed(1)} MB`;
-  return `${(n / 1073741824).toFixed(2)} GB`;
+  if (n < 1024 * 1024 * 1024 * 1024) return `${(n / 1073741824).toFixed(2)} GB`;
+  return `${(n / 1099511627776).toFixed(2)} TB`;
+}
+
+function fmtRate(bytesPerSec) {
+  if (bytesPerSec == null || isNaN(bytesPerSec)) return '—';
+  if (bytesPerSec < 1024) return `${bytesPerSec} B/s`;
+  if (bytesPerSec < 1048576) return `${(bytesPerSec / 1024).toFixed(1)} KB/s`;
+  if (bytesPerSec < 1073741824) return `${(bytesPerSec / 1048576).toFixed(2)} MB/s`;
+  return `${(bytesPerSec / 1073741824).toFixed(2)} GB/s`;
+}
+
+function fmtCompactBytes(n) {
+  if (n == null || isNaN(n)) return '—';
+  if (n < 1024) return `${n}B`;
+  if (n < 1048576) return `${Math.round(n / 1024)}K`;
+  if (n < 1073741824) return `${(n / 1048576).toFixed(1).replace(/\.0$/, '')}M`;
+  if (n < 1099511627776) return `${(n / 1073741824).toFixed(1).replace(/\.0$/, '')}G`;
+  return `${(n / 1099511627776).toFixed(2)}T`;
+}
+
+function fmtBillingCycle(c) {
+  return { monthly: '月付', quarterly: '季付', semiannual: '半年付', yearly: '年付', biennial: '两年付', triennial: '三年付', onetime: '一次性' }[c] || '';
+}
+
+function getExpiryInfo(expiresAt) {
+  if (!expiresAt) return null;
+  const end = new Date(expiresAt + 'T23:59:59');
+  if (isNaN(end.getTime())) return null;
+  const days = Math.ceil((end.getTime() - Date.now()) / 86400000);
+  if (days < 0) return { days, text: `已过期 ${Math.abs(days)} 天`, cls: 'danger' };
+  if (days === 0) return { days, text: '今日到期', cls: 'danger' };
+  if (days <= 7) return { days, text: `剩 ${days} 天`, cls: 'danger' };
+  if (days <= 30) return { days, text: `剩 ${days} 天`, cls: 'warn' };
+  return { days, text: `剩 ${days} 天`, cls: 'ok' };
 }
 
 function fmtDate(iso) {
@@ -135,6 +172,7 @@ function showAuthPanel(isSetup) {
   selected = null;
   closeTerminal();
   stopJobPoll();
+  stopProbeTimer();
   $$('dialog[open]').forEach(d => d.close());
   $('#app').classList.add('hidden');
   $('#login').classList.remove('hidden');
@@ -206,6 +244,7 @@ function navigateTo(view) {
 
 $$('.nav-item').forEach(b => b.onclick = async () => {
   const view = b.dataset.view;
+  currentView = view;
   $$('.nav-item').forEach(x => x.classList.toggle('active', x === b));
   $$('.page').forEach(x => x.classList.add('hidden'));
   $('#view-' + view).classList.remove('hidden');
@@ -234,23 +273,39 @@ function barClass(pct) {
 }
 
 function updateMetrics() {
-  $('#metric-total').textContent = servers.length;
   $('#nav-count').textContent = servers.length;
 
   const snaps = servers.map(s => snapshots.get(s.id)).filter(Boolean);
+  const expiringAlerts = servers.filter(s => { const e = getExpiryInfo(s.expiresAt); return e && e.days <= 7; }).length;
   if (snaps.length === 0) {
     $('#metric-online').textContent = '—';
     $('#metric-online').className = '';
-    $('#metric-online-sub').textContent = '点击“刷新主机状态”采集指标';
-    $('#metric-alerts').textContent = '0';
-    $('#metric-alerts').className = 'ok';
+    $('#metric-online-sub').innerHTML = `共 <span id="metric-total">${servers.length}</span> 台 · 点击刷新采集`;
+    $('#metric-capacity').textContent = '—';
+    $('#metric-capacity-sub').textContent = '采集后统计总核数与总内存';
+    $('#metric-net').textContent = '—';
+    $('#metric-alerts').textContent = String(expiringAlerts);
+    $('#metric-alerts').className = expiringAlerts > 0 ? 'danger' : 'ok';
   } else {
-    const online = snaps.filter(x => x.online).length;
+    const onlineSnaps = snaps.filter(x => x.online);
+    const online = onlineSnaps.length;
     $('#metric-online').textContent = `${online} / ${servers.length}`;
     $('#metric-online').className = online === servers.length ? 'ok' : (online === 0 ? 'danger' : 'warn');
-    $('#metric-online-sub').textContent = `已采集 ${snaps.length} 台主机状态`;
-    const alerts = snaps.filter(x => !x.online || (x.memPercent ?? 0) >= 85 || (x.diskPercent ?? 0) >= 85).length;
-    $('#metric-alerts').textContent = alerts;
+    $('#metric-online-sub').innerHTML = `共 <span id="metric-total">${servers.length}</span> 台 · 已采集 ${snaps.length} 台`;
+
+    const totalCores = onlineSnaps.reduce((a, x) => a + (x.cpuCores || 0), 0);
+    const totalMemMb = onlineSnaps.reduce((a, x) => a + (x.memTotalMb || 0), 0);
+    const totalDiskMb = onlineSnaps.reduce((a, x) => a + (x.diskTotalMb || (x.diskTotalGb ? x.diskTotalGb * 1024 : 0)), 0);
+    $('#metric-capacity').textContent = `${totalCores}核 · ${fmtMemMb(totalMemMb)}`;
+    $('#metric-capacity-sub').textContent = `根分区合计 ${fmtDiskSize(totalDiskMb, null)}`;
+
+    const rxRate = onlineSnaps.reduce((a, x) => a + (x.netRxBytesPerSec || 0), 0);
+    const txRate = onlineSnaps.reduce((a, x) => a + (x.netTxBytesPerSec || 0), 0);
+    $('#metric-net').textContent = `↓ ${fmtRate(rxRate)} · ↑ ${fmtRate(txRate)}`;
+
+    const resAlerts = snaps.filter(x => !x.online || (x.memPercent ?? 0) >= 85 || (x.diskPercent ?? 0) >= 85).length;
+    const alerts = resAlerts + expiringAlerts;
+    $('#metric-alerts').textContent = String(alerts);
     $('#metric-alerts').className = alerts > 0 ? 'danger' : 'ok';
   }
 
@@ -317,53 +372,140 @@ function renderResBars(snap, serverId) {
   const diskSpec = (snap.diskTotalMb || snap.diskTotalGb)
     ? `${fmtDiskSize(snap.diskUsedMb, snap.diskUsedGb)} / ${fmtDiskSize(snap.diskTotalMb, snap.diskTotalGb)}`
     : '—';
+  const extraMounts = (snap.disks || []).filter(d => d.mountPoint !== '/');
+  const mountChipsHtml = extraMounts.length
+    ? `<div class="mount-chips">${extraMounts.map(d => `<span class="mount-chip" title="${escapeHtml(d.filesystem)} · 可用 ${fmtDiskSize(d.availMb, null)}">${escapeHtml(d.mountPoint)}: ${Math.round(d.percent)}% (${fmtDiskSize(d.usedMb, null)}/${fmtDiskSize(d.totalMb, null)})</span>`).join('')}</div>`
+    : '';
   const tip = `负载: ${snap.loadAverage || '—'} · 运行: ${snap.uptime || '—'} · 采集于 ${fmtDate(snap.checkedAt)}`;
-  return `<div class="res-bars${isCollecting ? ' refreshing' : ''}" title="${escapeHtml(tip)}">${row('CPU', snap.cpuPercent, cpuSpec)}${row('内存', snap.memPercent, memSpec)}${row('Swap', swapPct, swapSpec)}${row('磁盘', snap.diskPercent, diskSpec)}</div>`;
+  return `<div class="res-bars${isCollecting ? ' refreshing' : ''}" title="${escapeHtml(tip)}">${row('CPU', snap.cpuPercent, cpuSpec)}${row('内存', snap.memPercent, memSpec)}${row('Swap', swapPct, swapSpec)}${row('磁盘', snap.diskPercent, diskSpec)}${mountChipsHtml}</div>`;
 }
 
-async function collectSnapshots(ids, { silent = false } = {}) {
-  const queue = [...new Set(ids)].filter(id => id && !collectingSnapshots.has(id));
-  if (!queue.length) return;
-  queue.forEach(id => collectingSnapshots.add(id));
-  renderServers();
-  let done = 0;
-  const worker = async () => {
-    while (queue.length) {
-      const id = queue.shift();
-      try {
-        const s = await api(`/api/servers/${id}/snapshot`, { method: 'POST' });
-        snapshots.set(s.serverId, s);
-        done++;
-      } catch {
-      } finally {
-        collectingSnapshots.delete(id);
-        renderServers();
-        updateMetrics();
-        if (selected?.id === id) renderSnapshotTab();
+function renderNetStrip(s, snap) {
+  if (!snap || !snap.online) return '';
+  if (snap.netRxBytesPerSec == null && snap.netRxTotalBytes == null) return '';
+  const rateHtml = snap.netRxBytesPerSec != null
+    ? `<div class="probe-net-rate"><span class="down">↓ ${fmtRate(snap.netRxBytesPerSec)}</span><span class="up">↑ ${fmtRate(snap.netTxBytesPerSec)}</span></div>`
+    : '<div class="probe-net-rate">实时网速 —</div>';
+  const totalBytes = (snap.netRxTotalBytes || 0) + (snap.netTxTotalBytes || 0);
+  const quotaText = s.trafficLimitGb ? ` · 限额 ${s.trafficLimitGb}G${s.trafficResetDay ? `(${s.trafficResetDay}日重置)` : ''}` : '';
+  const totalHtml = snap.netRxTotalBytes != null
+    ? `<div class="probe-net-total" title="自最近一次系统开机以来的网卡累计流量 (合计 ${fmtCompactBytes(totalBytes)})">开机累计 ↓${fmtCompactBytes(snap.netRxTotalBytes)} ↑${fmtCompactBytes(snap.netTxTotalBytes)}${escapeHtml(quotaText)}</div>`
+    : (s.trafficLimitGb ? `<div class="probe-net-total">月限额 ${s.trafficLimitGb}G</div>` : '');
+  return `<div class="probe-net">${rateHtml}${totalHtml}</div>`;
+}
+
+function renderAssetBadges(s) {
+  const items = [];
+  if (s.provider || s.region) {
+    const label = [s.provider, s.region].filter(Boolean).join(' · ');
+    items.push(`<span class="badge blue">${escapeHtml(label)}</span>`);
+  }
+  const exp = getExpiryInfo(s.expiresAt);
+  if (exp) items.push(`<span class="badge ${exp.cls}" title="到期日: ${escapeHtml(s.expiresAt)}">${escapeHtml(exp.text)}</span>`);
+  const cycle = fmtBillingCycle(s.billingCycle);
+  if (s.renewalPrice || cycle) {
+    const priceLabel = [s.renewalPrice, cycle].filter(Boolean).join(' · ');
+    items.push(`<span class="badge">${escapeHtml(priceLabel)}</span>`);
+  }
+  return items.join('');
+}
+
+function stopProbeTimer() {
+  if (probeTimer) { clearInterval(probeTimer); probeTimer = null; }
+}
+
+function applyProbeInterval() {
+  stopProbeTimer();
+  const sec = Number($('#probe-interval')?.value || 0);
+  if (sec > 0) {
+    probeTimer = setInterval(() => {
+      if (document.visibilityState === 'visible' && currentView === 'servers' && servers.length && collectingSnapshots.size === 0) {
+        collectSnapshots(servers.map(s => s.id), { silent: true });
       }
-    }
-  };
-  await Promise.all(Array.from({ length: Math.min(4, Math.max(1, ids.length)) }, worker));
-  if (!silent) toast(`已刷新 ${done} 台主机状态`);
+    }, sec * 1000);
+  }
 }
 
-function collectMissingSnapshots() {
-  const missing = servers.filter(s => !snapshots.has(s.id)).map(s => s.id);
-  if (missing.length) collectSnapshots(missing, { silent: true });
+function applyViewMode(mode) {
+  serverViewMode = mode === 'table' ? 'table' : 'cards';
+  localStorage.setItem('sp_view_mode', serverViewMode);
+  $('#view-mode-cards')?.classList.toggle('active', serverViewMode === 'cards');
+  $('#view-mode-table')?.classList.toggle('active', serverViewMode === 'table');
+  $('#server-cards')?.classList.toggle('hidden', serverViewMode !== 'cards');
+  $('#server-table-wrap')?.classList.toggle('hidden', serverViewMode !== 'table');
 }
 
 function renderServers() {
   const q = $('#search').value.trim().toLowerCase();
   const byId = new Map(servers.map(s => [s.id, s.name]));
   const keyById = new Map(sharedKeys.map(k => [k.id, k.name]));
-  const filtered = servers.filter(s => [s.name, s.host, s.tags, s.notes].some(v => (v || '').toLowerCase().includes(q)));
+  const filtered = servers.filter(s => [s.name, s.host, s.tags, s.notes, s.provider, s.region].some(v => (v || '').toLowerCase().includes(q)));
   $('#empty-servers').classList.toggle('hidden', servers.length > 0);
+  applyViewMode(serverViewMode);
+
+  $('#server-cards').innerHTML = filtered.map(s => {
+    const snap = snapshots.get(s.id);
+    const isCollecting = collectingSnapshots.has(s.id);
+    const dotCls = snap ? (snap.online ? 'online' : 'offline') : '';
+    const jumpName = s.jumpServerId ? byId.get(s.jumpServerId) : null;
+    const sharedKeyName = s.sharedKeyId ? keyById.get(s.sharedKeyId) : null;
+    const latCls = snap?.latencyMs >= 180 ? 'warn' : (snap?.latencyMs <= 50 ? 'ok' : 'blue');
+    const latencyBadge = snap?.online
+      ? `<span class="badge ${latCls}" title="网络延迟 (TCP RTT)">${snap.latencyMs}ms</span>`
+      : (snap && !snap.online ? `<span class="badge danger" title="${escapeHtml(snap.error || '')}">离线</span>` : '');
+    const tagsHtml = (s.tags || '').split(',').filter(Boolean).map(t => `<span class="badge">${escapeHtml(t.trim())}</span>`).join('');
+    const osLine = snap?.online
+      ? [snap.osName, snap.uptime ? `运行 ${snap.uptime}` : ''].filter(Boolean).join(' · ')
+      : (s.notes || 'SSH 主机');
+    const dockerMeta = snap?.online && snap.dockerTotal != null ? `<span>Docker ${snap.dockerRunning}/${snap.dockerTotal}</span>` : '';
+    const failMeta = snap?.online && snap.failedServices > 0 ? `<span class="badge danger">异常服务 ${snap.failedServices}</span>` : '';
+    return `<article class="probe-card${snap && !snap.online ? ' offline' : ''}">
+      <div class="probe-head">
+        <div class="probe-head-left">
+          <div class="server-icon">${lineIcon('server')}<span class="status-dot ${dotCls}"></span></div>
+          <div class="probe-head-title">
+            <div class="server-name">${escapeHtml(s.name)}${jumpName ? `<span class="badge blue">跳板: ${escapeHtml(jumpName)}</span>` : ''}</div>
+            <div class="probe-host mono">${escapeHtml(s.username)}@${escapeHtml(s.host)}:${s.port}</div>
+            <div class="server-sub">${escapeHtml(osLine)}</div>
+          </div>
+        </div>
+        <div class="probe-head-right">
+          ${latencyBadge}
+          <button type="button" class="link-button secondary-action" style="padding:2px 6px;font-size:11px" data-action="snapshot" data-id="${s.id}" ${isCollecting ? 'disabled' : ''} title="刷新此主机探针">↻</button>
+        </div>
+      </div>
+      <div class="probe-badges">
+        ${sharedKeyName ? `<span class="badge blue">密钥: ${escapeHtml(sharedKeyName)}</span>` : `<span class="badge key">${s.authType === 'password' ? '密码' : '独立私钥'}</span>`}
+        ${s.useServiceKey ? '<span class="badge">服务端密钥</span>' : ''}
+        ${s.proxy ? '<span class="badge">代理</span>' : ''}
+        ${renderAssetBadges(s)}
+        ${tagsHtml}
+      </div>
+      <div class="probe-metrics">${renderResBars(snap, s.id)}</div>
+      ${renderNetStrip(s, snap)}
+      <div class="probe-foot">
+        <div class="probe-meta-line">${dockerMeta}${failMeta}${!dockerMeta && !failMeta && s.notes ? `<span>${escapeHtml(s.notes)}</span>` : ''}</div>
+        <div class="row-actions">
+          <button class="link-button pill-primary" data-action="terminal" data-id="${s.id}">终端</button>
+          <button class="link-button" data-action="sftp" data-id="${s.id}">文件</button>
+          <button class="link-button secondary-action" data-action="operate" data-id="${s.id}">工作台</button>
+          <button class="link-button secondary-action" data-action="test" data-id="${s.id}">测试</button>
+          <button class="link-button secondary-action" data-action="edit" data-id="${s.id}">编辑</button>
+          <button class="link-button danger" data-action="delete" data-id="${s.id}">删除</button>
+        </div>
+      </div>
+    </article>`;
+  }).join('');
+
   $('#server-rows').innerHTML = filtered.map(s => {
     const snap = snapshots.get(s.id);
     const dotCls = snap ? (snap.online ? 'online' : 'offline') : '';
     const jumpName = s.jumpServerId ? byId.get(s.jumpServerId) : null;
     const sharedKeyName = s.sharedKeyId ? keyById.get(s.sharedKeyId) : null;
     const latency = snap?.online ? `<span class="badge blue" title="网络延迟 (TCP RTT)">${snap.latencyMs}ms</span>` : '';
+    const netText = snap?.online && snap.netRxBytesPerSec != null
+      ? `<div class="server-sub mono">↓${fmtRate(snap.netRxBytesPerSec)} · ↑${fmtRate(snap.netTxBytesPerSec)}</div>`
+      : '';
     return `<tr>
       <td>
         <div class="server-cell">
@@ -381,10 +523,11 @@ function renderServers() {
           ${s.useServiceKey ? '<span class="badge">服务端密钥</span>' : ''}
           ${s.proxy ? '<span class="badge">代理</span>' : ''}
           ${latency}
+          ${renderAssetBadges(s)}
         </div>
       </td>
       <td>${renderResBars(snap, s.id)}</td>
-      <td>${(s.tags || '').split(',').filter(Boolean).map(t => `<span class="badge">${escapeHtml(t.trim())}</span>`).join('') || '<span class="server-sub">—</span>'}</td>
+      <td>${(s.tags || '').split(',').filter(Boolean).map(t => `<span class="badge">${escapeHtml(t.trim())}</span>`).join('') || '<span class="server-sub">—</span>'}${netText}</td>
       <td>
         <div class="row-actions">
           <button class="link-button pill-primary" data-action="terminal" data-id="${s.id}">终端</button>
@@ -400,6 +543,9 @@ function renderServers() {
 }
 
 $('#search').oninput = renderServers;
+$('#view-mode-cards').onclick = () => applyViewMode('cards');
+$('#view-mode-table').onclick = () => applyViewMode('table');
+$('#probe-interval').onchange = applyProbeInterval;
 $('#refresh-servers').onclick = async () => {
   await Promise.all([loadServers(), loadCachedSnapshots()]);
   collectMissingSnapshots();
@@ -681,8 +827,16 @@ function editServer(s, prefill = null) {
     tags: src.tags || '',
     notes: src.notes || '',
     proxy: src.proxy || '',
-    allowedRemotePaths: src.allowedRemotePaths || ''
+    allowedRemotePaths: src.allowedRemotePaths || '',
+    provider: src.provider || '',
+    region: src.region || '',
+    expiresAt: src.expiresAt || '',
+    billingCycle: src.billingCycle || '',
+    renewalPrice: src.renewalPrice || '',
+    trafficLimitGb: src.trafficLimitGb ?? '',
+    trafficResetDay: src.trafficResetDay ?? ''
   })) x.namedItem(name).value = value;
+  $('#asset-details').open = !!(src.provider || src.region || src.expiresAt || src.billingCycle || src.renewalPrice || src.trafficLimitGb || src.trafficResetDay);
   x.namedItem('tryKeyboard').checked = !!s?.tryKeyboard;
   x.namedItem('useServiceKey').checked = !!s?.useServiceKey;
   $('#server-dialog-title').textContent = s ? '编辑服务器' : '添加服务器';
@@ -708,6 +862,8 @@ $('#server-form').onsubmit = async e => {
     data.port = Number(data.port);
     data.tryKeyboard = data.tryKeyboard === 'on';
     data.useServiceKey = data.useServiceKey === 'on';
+    data.trafficLimitGb = data.trafficLimitGb === '' ? null : Number(data.trafficLimitGb);
+    data.trafficResetDay = data.trafficResetDay === '' ? null : Number(data.trafficResetDay);
     delete data.id;
     const saved = await api('/api/servers' + (id ? '/' + id : ''), { method: id ? 'PUT' : 'POST', body: data });
     f.reset();
@@ -815,12 +971,13 @@ $('#toggle-workspace-fullscreen').onclick = e => {
   setTimeout(fitTerminal, 80);
 };
 
-$('#server-rows').onclick = async e => {
+async function handleServerAction(e) {
   const b = e.target.closest('button');
   if (!b) return;
   const s = servers.find(x => x.id === b.dataset.id);
   if (!s) return;
   try {
+    if (b.dataset.action === 'snapshot') await collectSnapshots([s.id]);
     if (b.dataset.action === 'edit') editServer(s);
     if (b.dataset.action === 'terminal') openWorkspace(s, 'terminal');
     if (b.dataset.action === 'sftp') { currentSftpPath = s.allowedRemotePaths.split('\n').filter(Boolean)[0] || '/'; openWorkspace(s, 'sftp'); }
@@ -838,7 +995,10 @@ $('#server-rows').onclick = async e => {
     }
   } catch (err) { toast(err.message); }
   finally { b.disabled = false; }
-};
+}
+
+$('#server-rows').onclick = handleServerAction;
+$('#server-cards').onclick = handleServerAction;
 
 // --- WebSSH Terminal (xterm.js + WebSocket) ---
 let termFontSize = 14;
@@ -1331,13 +1491,40 @@ function renderSnapshotTab() {
   const swapCardSub = s.swapTotalMb == null
     ? '—'
     : (s.swapTotalMb === 0 ? '未启用 Swap' : `${fmtMemMb(s.swapUsedMb)} / ${fmtMemMb(s.swapTotalMb)} (${s.swapUsedMb} / ${s.swapTotalMb} MB)`);
+  const netCard = s.netRxBytesPerSec != null || s.netRxTotalBytes != null
+    ? `<div class="snap-card">
+        <small>实时网速 &amp; 开机累计流量</small>
+        <strong style="font-size:17px">↓ ${fmtRate(s.netRxBytesPerSec)} · ↑ ${fmtRate(s.netTxBytesPerSec)}</strong>
+        <div class="footnote" style="margin:0">累计入站 ${fmtBytes(s.netRxTotalBytes)} · 出站 ${fmtBytes(s.netTxTotalBytes)}</div>
+      </div>`
+    : '';
+  const mountsHtml = (s.disks && s.disks.length)
+    ? `<div class="field-title">磁盘挂载点 (${s.disks.length})</div><div class="mount-grid">${s.disks.map(d => {
+        const w = Math.min(100, Math.max(0, d.percent || 0));
+        return `<div class="mount-card">
+          <div class="mount-card-head"><span class="mono">${escapeHtml(d.mountPoint)}</span><span>${d.percent.toFixed(1)}%</span></div>
+          <div class="res-track" style="width:100%;height:6px;margin-bottom:6px"><div class="res-fill ${barClass(d.percent)}" style="width:${w}%"></div></div>
+          <div class="footnote" style="margin:0">${fmtDiskSize(d.usedMb, null)} / ${fmtDiskSize(d.totalMb, null)} · 可用 ${fmtDiskSize(d.availMb, null)} (${escapeHtml(d.filesystem)})</div>
+        </div>`;
+      }).join('')}</div>`
+    : '';
+  const expInfo = getExpiryInfo(selected.expiresAt);
+  const assetText = [
+    selected.provider,
+    selected.region,
+    selected.expiresAt ? `到期 ${selected.expiresAt}${expInfo ? ` (${expInfo.text})` : ''}` : '',
+    [selected.renewalPrice, fmtBillingCycle(selected.billingCycle)].filter(Boolean).join(' '),
+    selected.trafficLimitGb ? `月限额 ${selected.trafficLimitGb}G${selected.trafficResetDay ? ` (每月${selected.trafficResetDay}日重置)` : ''}` : ''
+  ].filter(Boolean).join(' · ');
   $('#snap-content').innerHTML = `
     <div class="snap-grid">
       ${gauge('CPU 使用率', s.cpuPercent, `${s.cpuCores ?? '?'} 核心 · 负载 ${s.loadAverage || '—'}`)}
       ${gauge('内存使用率', s.memPercent, s.memTotalMb ? `${fmtMemMb(s.memUsedMb)} / ${fmtMemMb(s.memTotalMb)} (${s.memUsedMb} / ${s.memTotalMb} MB)` : '—')}
       ${gauge('Swap 交换分区', swapCardPct, swapCardSub)}
       ${gauge('根分区磁盘', s.diskPercent, (s.diskTotalMb || s.diskTotalGb) ? `${fmtDiskSize(s.diskUsedMb, s.diskUsedGb)} / ${fmtDiskSize(s.diskTotalMb, s.diskTotalGb)}` : '—')}
+      ${netCard}
     </div>
+    ${mountsHtml}
     <div class="snap-meta">
       <div><span>主机名</span><strong>${escapeHtml(s.hostname || '—')}</strong></div>
       <div><span>系统</span><strong>${escapeHtml(s.osName || '—')} (${escapeHtml(s.kernel || '—')})</strong></div>
@@ -1345,6 +1532,7 @@ function renderSnapshotTab() {
       <div><span>Docker 容器</span><strong>${s.dockerTotal != null ? `运行中 ${s.dockerRunning} / 共 ${s.dockerTotal}` : '未安装或无权限'}</strong></div>
       <div><span>失败 Systemd 服务</span><strong>${s.failedServices != null ? s.failedServices : '—'}</strong></div>
       <div><span>TCP 监听端口 (${s.listeningPortsCount ?? 0})</span><strong class="mono">${escapeHtml(s.listeningPorts || '—')}</strong></div>
+      ${assetText ? `<div style="grid-column:1 / -1"><span>VPS 资产</span><strong>${escapeHtml(assetText)}</strong></div>` : ''}
     </div>`;
 }
 

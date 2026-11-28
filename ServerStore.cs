@@ -8,10 +8,14 @@ using Microsoft.Data.Sqlite;
 namespace ServerPilot;
 
 public sealed record ServerInput(string? Name, string? Host, int Port, string? Username, string? AuthType, string? Password, string? PrivateKey, string? Passphrase, string? HostFingerprint, string? Tags, string? Notes,
-    bool UseServiceKey = false, bool TryKeyboard = false, string? Proxy = null, string? AllowedRemotePaths = null, string? SharedKeyId = null, string? JumpServerId = null);
+    bool UseServiceKey = false, bool TryKeyboard = false, string? Proxy = null, string? AllowedRemotePaths = null, string? SharedKeyId = null, string? JumpServerId = null,
+    string? Provider = null, string? Region = null, string? ExpiresAt = null, string? BillingCycle = null, string? RenewalPrice = null,
+    double? TrafficLimitGb = null, int? TrafficResetDay = null);
 public sealed record SharedKeyInput(string? Name, string? PrivateKey, string? Passphrase, string? Notes = null);
 public sealed record ServerView(string Id, string Name, string Host, int Port, string Username, string AuthType, string HostFingerprint, string Tags, string Notes, string UpdatedAt,
-    bool UseServiceKey, bool TryKeyboard, string Proxy, string AllowedRemotePaths, string JumpServerId = "", string SharedKeyId = "");
+    bool UseServiceKey, bool TryKeyboard, string Proxy, string AllowedRemotePaths, string JumpServerId = "", string SharedKeyId = "",
+    string Provider = "", string Region = "", string ExpiresAt = "", string BillingCycle = "", string RenewalPrice = "",
+    double? TrafficLimitGb = null, int? TrafficResetDay = null);
 public sealed record Credential(string? Password, string? PrivateKey, string? Passphrase, string? ProxyUrl = null);
 public sealed record StoredServer(ServerView View, Credential Credential);
 
@@ -38,7 +42,10 @@ public sealed class ServerStore(AppOptions options)
                 host_fingerprint TEXT NOT NULL, tags TEXT NOT NULL, notes TEXT NOT NULL,
                 credential TEXT NOT NULL, updated_at TEXT NOT NULL,
                 use_service_key INTEGER NOT NULL DEFAULT 0, try_keyboard INTEGER NOT NULL DEFAULT 0, proxy TEXT NOT NULL DEFAULT '',
-                allowed_remote_paths TEXT NOT NULL DEFAULT '', jump_server_id TEXT NOT NULL DEFAULT '', shared_key_id TEXT NOT NULL DEFAULT '');
+                allowed_remote_paths TEXT NOT NULL DEFAULT '', jump_server_id TEXT NOT NULL DEFAULT '', shared_key_id TEXT NOT NULL DEFAULT '',
+                provider TEXT NOT NULL DEFAULT '', region TEXT NOT NULL DEFAULT '', expires_at TEXT NOT NULL DEFAULT '',
+                billing_cycle TEXT NOT NULL DEFAULT '', renewal_price TEXT NOT NULL DEFAULT '',
+                traffic_limit_gb REAL, traffic_reset_day INTEGER);
             CREATE TABLE IF NOT EXISTS audit(
                 id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, actor TEXT NOT NULL,
                 server_name TEXT NOT NULL, action TEXT NOT NULL, result TEXT NOT NULL,
@@ -77,7 +84,14 @@ public sealed class ServerStore(AppOptions options)
             ("proxy", "ALTER TABLE servers ADD COLUMN proxy TEXT NOT NULL DEFAULT ''"),
             ("allowed_remote_paths", "ALTER TABLE servers ADD COLUMN allowed_remote_paths TEXT NOT NULL DEFAULT ''"),
             ("jump_server_id", "ALTER TABLE servers ADD COLUMN jump_server_id TEXT NOT NULL DEFAULT ''"),
-            ("shared_key_id", "ALTER TABLE servers ADD COLUMN shared_key_id TEXT NOT NULL DEFAULT ''")
+            ("shared_key_id", "ALTER TABLE servers ADD COLUMN shared_key_id TEXT NOT NULL DEFAULT ''"),
+            ("provider", "ALTER TABLE servers ADD COLUMN provider TEXT NOT NULL DEFAULT ''"),
+            ("region", "ALTER TABLE servers ADD COLUMN region TEXT NOT NULL DEFAULT ''"),
+            ("expires_at", "ALTER TABLE servers ADD COLUMN expires_at TEXT NOT NULL DEFAULT ''"),
+            ("billing_cycle", "ALTER TABLE servers ADD COLUMN billing_cycle TEXT NOT NULL DEFAULT ''"),
+            ("renewal_price", "ALTER TABLE servers ADD COLUMN renewal_price TEXT NOT NULL DEFAULT ''"),
+            ("traffic_limit_gb", "ALTER TABLE servers ADD COLUMN traffic_limit_gb REAL"),
+            ("traffic_reset_day", "ALTER TABLE servers ADD COLUMN traffic_reset_day INTEGER")
         ]);
         EnsureTableColumns(c, "shared_keys", [
             ("algorithm", "ALTER TABLE shared_keys ADD COLUMN algorithm TEXT NOT NULL DEFAULT ''"),
@@ -146,24 +160,26 @@ public sealed class ServerStore(AppOptions options)
     private static ServerView View(SqliteDataReader r) => new(
         r.GetString(0), r.GetString(1), r.GetString(2), r.GetInt32(3), r.GetString(4),
         r.GetString(5), r.GetString(6), r.GetString(7), r.GetString(8), r.GetString(9),
-        r.GetInt32(10) != 0, r.GetInt32(11) != 0, MaskProxy(r.GetString(12)), r.GetString(13), r.GetString(14), r.GetString(15));
+        r.GetInt32(10) != 0, r.GetInt32(11) != 0, MaskProxy(r.GetString(12)), r.GetString(13), r.GetString(14), r.GetString(15),
+        r.GetString(16), r.GetString(17), r.GetString(18), r.GetString(19), r.GetString(20),
+        r.IsDBNull(21) ? null : r.GetDouble(21), r.IsDBNull(22) ? null : r.GetInt32(22));
 
     public List<ServerView> List()
     {
         using var c = Open(); using var cmd = c.CreateCommand();
-        cmd.CommandText = "SELECT id,name,host,port,username,auth_type,host_fingerprint,tags,notes,updated_at,use_service_key,try_keyboard,proxy,allowed_remote_paths,jump_server_id,shared_key_id FROM servers ORDER BY name";
+        cmd.CommandText = "SELECT id,name,host,port,username,auth_type,host_fingerprint,tags,notes,updated_at,use_service_key,try_keyboard,proxy,allowed_remote_paths,jump_server_id,shared_key_id,provider,region,expires_at,billing_cycle,renewal_price,traffic_limit_gb,traffic_reset_day FROM servers ORDER BY name";
         using var r = cmd.ExecuteReader(); var rows = new List<ServerView>(); while (r.Read()) rows.Add(View(r)); return rows;
     }
 
     public StoredServer Get(string idOrName)
     {
         using var c = Open(); using var cmd = c.CreateCommand();
-        cmd.CommandText = "SELECT id,name,host,port,username,auth_type,host_fingerprint,tags,notes,updated_at,use_service_key,try_keyboard,proxy,allowed_remote_paths,jump_server_id,shared_key_id,credential FROM servers WHERE id=$id OR name=$id COLLATE NOCASE";
+        cmd.CommandText = "SELECT id,name,host,port,username,auth_type,host_fingerprint,tags,notes,updated_at,use_service_key,try_keyboard,proxy,allowed_remote_paths,jump_server_id,shared_key_id,provider,region,expires_at,billing_cycle,renewal_price,traffic_limit_gb,traffic_reset_day,credential FROM servers WHERE id=$id OR name=$id COLLATE NOCASE";
         cmd.Parameters.AddWithValue("$id", idOrName);
         using var r = cmd.ExecuteReader();
         if (!r.Read()) throw new ArgumentException("找不到指定服务器。请使用服务器 ID 或名称。");
         var view = View(r);
-        var cred = Decrypt(r.GetString(16));
+        var cred = Decrypt(r.GetString(23));
         if (string.IsNullOrWhiteSpace(cred.ProxyUrl) && !string.IsNullOrWhiteSpace(r.GetString(12)))
             cred = cred with { ProxyUrl = r.GetString(12) };
         if (view.AuthType == "privateKey" && !string.IsNullOrEmpty(view.SharedKeyId))
@@ -239,27 +255,45 @@ public sealed class ServerStore(AppOptions options)
         if (!string.IsNullOrEmpty(jumpServerId))
             ValidateJumpChain(id, jumpServerId);
 
+        var provider = Optional(input.Provider, 80);
+        var region = Optional(input.Region, 80);
+        var expiresAt = (input.ExpiresAt ?? "").Trim();
+        if (expiresAt.Length > 0 && !DateOnly.TryParseExact(expiresAt, "yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.None, out _))
+            throw new ArgumentException("到期日期格式应为 YYYY-MM-DD。");
+        var billingCycle = Optional(input.BillingCycle, 40);
+        var renewalPrice = Optional(input.RenewalPrice, 40);
+        var trafficLimitGb = input.TrafficLimitGb;
+        if (trafficLimitGb.HasValue && (double.IsNaN(trafficLimitGb.Value) || double.IsInfinity(trafficLimitGb.Value) || trafficLimitGb.Value <= 0 || trafficLimitGb.Value > 10_000_000))
+            throw new ArgumentException("月流量限额应在 0–10000000 GB 之间。");
+        var trafficResetDay = input.TrafficResetDay;
+        if (trafficResetDay.HasValue && trafficResetDay.Value is < 1 or > 31)
+            throw new ArgumentException("流量重置日应在 1–31 之间。");
+
         var updated = DateTimeOffset.UtcNow.ToString("O");
         using var c = Open(); using var cmd = c.CreateCommand();
         cmd.CommandText = """
-            INSERT INTO servers (id,name,host,port,username,auth_type,host_fingerprint,tags,notes,credential,updated_at,use_service_key,try_keyboard,proxy,allowed_remote_paths,jump_server_id,shared_key_id)
-            VALUES ($id,$name,$host,$port,$username,$auth,$fp,$tags,$notes,$credential,$updated,$serviceKey,$keyboard,$proxy,$allowed,$jump,$sharedKey)
+            INSERT INTO servers (id,name,host,port,username,auth_type,host_fingerprint,tags,notes,credential,updated_at,use_service_key,try_keyboard,proxy,allowed_remote_paths,jump_server_id,shared_key_id,provider,region,expires_at,billing_cycle,renewal_price,traffic_limit_gb,traffic_reset_day)
+            VALUES ($id,$name,$host,$port,$username,$auth,$fp,$tags,$notes,$credential,$updated,$serviceKey,$keyboard,$proxy,$allowed,$jump,$sharedKey,$provider,$region,$expiresAt,$billingCycle,$renewalPrice,$trafficLimit,$trafficReset)
             ON CONFLICT(id) DO UPDATE SET name=$name,host=$host,port=$port,username=$username,auth_type=$auth,
               host_fingerprint=$fp,tags=$tags,notes=$notes,credential=$credential,updated_at=$updated,
-              use_service_key=$serviceKey,try_keyboard=$keyboard,proxy=$proxy,allowed_remote_paths=$allowed,jump_server_id=$jump,shared_key_id=$sharedKey
+              use_service_key=$serviceKey,try_keyboard=$keyboard,proxy=$proxy,allowed_remote_paths=$allowed,jump_server_id=$jump,shared_key_id=$sharedKey,
+              provider=$provider,region=$region,expires_at=$expiresAt,billing_cycle=$billingCycle,renewal_price=$renewalPrice,traffic_limit_gb=$trafficLimit,traffic_reset_day=$trafficReset
             """;
         foreach (var (k, v) in new Dictionary<string, object>
         {
             ["$id"] = id, ["$name"] = name, ["$host"] = host, ["$port"] = input.Port, ["$username"] = username,
             ["$auth"] = auth, ["$fp"] = fingerprint, ["$tags"] = Optional(input.Tags, 300), ["$notes"] = Optional(input.Notes, 1000),
             ["$credential"] = Encrypt(credential), ["$updated"] = updated, ["$serviceKey"] = input.UseServiceKey ? 1 : 0,
-            ["$keyboard"] = input.TryKeyboard ? 1 : 0, ["$proxy"] = maskedProxy, ["$allowed"] = allowedRemote, ["$jump"] = jumpServerId, ["$sharedKey"] = sharedKeyId
+            ["$keyboard"] = input.TryKeyboard ? 1 : 0, ["$proxy"] = maskedProxy, ["$allowed"] = allowedRemote, ["$jump"] = jumpServerId, ["$sharedKey"] = sharedKeyId,
+            ["$provider"] = provider, ["$region"] = region, ["$expiresAt"] = expiresAt, ["$billingCycle"] = billingCycle, ["$renewalPrice"] = renewalPrice,
+            ["$trafficLimit"] = (object?)trafficLimitGb ?? DBNull.Value, ["$trafficReset"] = (object?)trafficResetDay ?? DBNull.Value
         }) cmd.Parameters.AddWithValue(k, v);
         try { cmd.ExecuteNonQuery(); } catch (SqliteException e) when (e.SqliteErrorCode == 19) { throw new ArgumentException("服务器名称已存在。"); }
         Audit("web", name, previous is null ? "server.create" : "server.update", "success");
         ServerChanged?.Invoke(id);
         return new(id, name, host, input.Port, username, auth, fingerprint, Optional(input.Tags, 300), Optional(input.Notes, 1000), updated,
-            input.UseServiceKey, input.TryKeyboard, maskedProxy, allowedRemote, jumpServerId, sharedKeyId);
+            input.UseServiceKey, input.TryKeyboard, maskedProxy, allowedRemote, jumpServerId, sharedKeyId,
+            provider, region, expiresAt, billingCycle, renewalPrice, trafficLimitGb, trafficResetDay);
     }
 
     public void BindServerToSharedKey(string serverId, string sharedKeyId)
@@ -1055,8 +1089,8 @@ public sealed class ServerStore(AppOptions options)
             if (exists && !overwriteExisting) { serversSkipped++; continue; }
             using var cmd = c.CreateCommand(); cmd.Transaction = tx;
             cmd.CommandText = """
-                INSERT OR REPLACE INTO servers (id,name,host,port,username,auth_type,host_fingerprint,tags,notes,credential,updated_at,use_service_key,try_keyboard,proxy,allowed_remote_paths,jump_server_id,shared_key_id)
-                VALUES ($id,$name,$host,$port,$username,$auth,$fp,$tags,$notes,$cred,$at,$sk,$kb,$proxy,$allowed,$jump,$sharedKey)
+                INSERT OR REPLACE INTO servers (id,name,host,port,username,auth_type,host_fingerprint,tags,notes,credential,updated_at,use_service_key,try_keyboard,proxy,allowed_remote_paths,jump_server_id,shared_key_id,provider,region,expires_at,billing_cycle,renewal_price,traffic_limit_gb,traffic_reset_day)
+                VALUES ($id,$name,$host,$port,$username,$auth,$fp,$tags,$notes,$cred,$at,$sk,$kb,$proxy,$allowed,$jump,$sharedKey,$provider,$region,$expiresAt,$billingCycle,$renewalPrice,$trafficLimit,$trafficReset)
                 """;
             cmd.Parameters.AddWithValue("$id", s.View.Id);
             cmd.Parameters.AddWithValue("$name", s.View.Name);
@@ -1075,6 +1109,13 @@ public sealed class ServerStore(AppOptions options)
             cmd.Parameters.AddWithValue("$allowed", s.View.AllowedRemotePaths);
             cmd.Parameters.AddWithValue("$jump", s.View.JumpServerId ?? "");
             cmd.Parameters.AddWithValue("$sharedKey", s.View.SharedKeyId ?? "");
+            cmd.Parameters.AddWithValue("$provider", s.View.Provider ?? "");
+            cmd.Parameters.AddWithValue("$region", s.View.Region ?? "");
+            cmd.Parameters.AddWithValue("$expiresAt", s.View.ExpiresAt ?? "");
+            cmd.Parameters.AddWithValue("$billingCycle", s.View.BillingCycle ?? "");
+            cmd.Parameters.AddWithValue("$renewalPrice", s.View.RenewalPrice ?? "");
+            cmd.Parameters.AddWithValue("$trafficLimit", (object?)s.View.TrafficLimitGb ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$trafficReset", (object?)s.View.TrafficResetDay ?? DBNull.Value);
             cmd.ExecuteNonQuery();
             serversImported++;
         }

@@ -376,7 +376,7 @@ api.MapGet("/servers/{id}/sftp/download", (string id, string path, SshOperations
     var (stream, fileName) = ssh.DirectDownload(id, path, "web");
     return TypedResults.File(stream, "application/octet-stream", fileName);
 }));
-api.MapPost("/servers/{id}/patch-file", async (string id, PatchFileInput input, SshOperations ssh) => await SafeAsync(async () => TypedResults.Ok(await ssh.PatchFile(id, input.RemotePath, input.OldText, input.NewText, input.ReplaceAll, "web"))));
+api.MapPost("/servers/{id}/patch-file", async (string id, PatchFileInput input, SshOperations ssh) => await SafeAsync(async () => TypedResults.Ok(await ssh.PatchFile(id, input.RemotePath, input.OldText, input.NewText, input.ReplaceAll, "web", input.ExpectedSha256))));
 
 // --- Staging & File Transfer ---
 api.MapGet("/files", (SshOperations ssh) => TypedResults.Ok(ssh.ListStaging()));

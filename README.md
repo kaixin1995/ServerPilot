@@ -93,8 +93,9 @@ ssh -N -L 5080:127.0.0.1:5080 管理机用户名@管理机地址
 - **导入 / 轮换**：上传或粘贴已有私钥，自动计算算法类型、公钥和 SHA-256 指纹；更新密钥后，所有引用该密钥的服务器会自动使用新密钥。
 - **一键下发公钥**：选择多台目标服务器，将公钥写入远端 `~/.ssh/authorized_keys`，并可勾选在下发成功后自动将服务器切换绑定为该密钥认证。
 
-### 3. 终端、文件与监控
+### 3. 探针卡片、终端、文件与监控
 
+- **主机探针视图**：默认提供直观的探针卡片网格（可一键切换为紧凑列表），集中展示 CPU 核数与负载、内存、Swap、多挂载点磁盘、实时网络上下行速率与开机累计流量，以及服务商/地区、到期倒计时、续费周期与月流量配额等 VPS 资产信息；支持手动刷新或开启前台探针轮询（10s / 30s / 60s）。
 - **WebSSH 终端**：在服务器操作栏打开实时交互终端，支持自适应窗口大小。
 - **SFTP 浏览器**：支持目录导航、新建文件夹、重命名、删除、本地文件上传与下载（单文件最大 512 MiB），以及文本文件在线查看与编辑。
 - **批量执行与后台任务**：支持按标签/多选服务器并行执行命令；长耗时任务可作为后台任务启动，随时查看输出、安全终止或清理历史任务目录。
@@ -125,14 +126,15 @@ claude mcp add --transport http serverpilot http://127.0.0.1:5080/mcp \
 claude mcp list
 ```
 
-### MCP 工具清单
+### MCP 工具清单（22 项）
 
 | 类别 | 工具名称 | 说明 |
 | --- | --- | --- |
-| 服务器与健康 | `list_servers`、`test_connection`、`server_snapshot` | 列出可见服务器、测试连接、采集系统与服务健康快照 |
+| 服务器与探针 | `list_servers`、`test_connection`、`server_snapshot` | 列出可见服务器、测试连接、采集 CPU/内存/Swap/多分区磁盘/实时网速与服务快照 |
+| 只读巡检与日志 | `tail_log`、`docker_status`、`docker_logs`、`service_status`、`service_logs` | 安全只读模式可用：SFTP 追踪日志末尾、结构化查询 Docker 容器/Systemd 服务状态与日志 |
 | 命令执行 | `execute_command`、`batch_execute` | 单机非交互式命令执行（最长 1800 秒）、多机并行批量执行 |
 | 后台任务 | `start_job`、`job_status`、`job_kill`、`job_list`、`job_cleanup` | 启动远端后台任务、查询进度与输出、安全终止进程组、列表与清理 |
-| 文件与文本 | `list_directory`、`list_staged_files`、`upload_file`、`download_file`、`read_file`、`write_file`、`patch_file` | SFTP 目录浏览、暂存区互传（最大 512 MiB）、UTF-8 文本分页读写（读 1 MiB / 写 2 MiB）与精确替换 |
+| 文件与文本 | `list_directory`、`list_staged_files`、`upload_file`、`download_file`、`read_file`、`write_file`、`patch_file` | SFTP 目录浏览、暂存区互传（最大 512 MiB）、UTF-8 文本分页读写（含 SHA-256 校验与乐观锁替换） |
 
 ---
 
