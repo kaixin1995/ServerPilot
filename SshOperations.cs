@@ -355,19 +355,20 @@ public sealed class SshOperations : IDisposable
         }
     }
 
-    private Lease<SshClient> RentSsh(StoredServer server, out bool fromPool)
+    private Task<(Lease<SshClient> Lease, bool FromPool)> RentSshAsync(StoredServer server, CancellationToken ct)
     {
         var key = PoolKey(server);
         if (_sshPool.TryGetValue(key, out var stack))
         {
             while (stack.TryPop(out var pooled))
             {
-                if (pooled.IsAlive) { fromPool = true; return new Lease<SshClient>(this, _sshPool, key, pooled); }
+                if (pooled.IsAlive) return Task.FromResult((new Lease<SshClient>(this, _sshPool, key, pooled), true));
                 pooled.Dispose();
             }
         }
-        fromPool = false;
-        return new Lease<SshClient>(this, _sshPool, key, CreateSsh(server));
+        return Task.Factory.StartNew(
+            () => (new Lease<SshClient>(this, _sshPool, key, CreateSsh(server)), false),
+            ct, TaskCreationOptions.LongRunning, TaskScheduler.Default);
     }
 
     private Lease<SftpClient> RentSftp(StoredServer server, out bool fromPool)
@@ -389,10 +390,10 @@ public sealed class SshOperations : IDisposable
     {
         for (var attempt = 0; attempt < 2; attempt++)
         {
-            var lease = await Task.Run(() => RentSsh(server, out var pooled) is var l ? (l, pooled) : default, ct);
-            using var handle = lease.l;
+            var (lease, fromPool) = await RentSshAsync(server, ct);
+            using var handle = lease;
             try { return await action(handle.Client); }
-            catch (Exception e) when (attempt == 0 && lease.pooled && e is SshConnectionException or ObjectDisposedException or IOException or System.Net.Sockets.SocketException)
+            catch (Exception e) when (attempt == 0 && fromPool && e is SshConnectionException or ObjectDisposedException or IOException or System.Net.Sockets.SocketException)
             {
                 handle.MarkBroken();
             }
@@ -536,80 +537,21 @@ public sealed class SshOperations : IDisposable
     // --- Server Snapshot / Health Monitoring ---
     public List<ServerSnapshot> GetCachedSnapshots() => _snapshots.Values.OrderBy(s => s.ServerName, StringComparer.OrdinalIgnoreCase).ToList();
 
-    public async Task<ServerSnapshot> GetSnapshot(string id, string actor, CancellationToken ct = default)
+    public async Task<ServerSnapshot> GetSnapshot(string id, string actor, CancellationToken ct = default, bool lite = false)
     {
         var server = store.Get(id);
+        _snapshots.TryGetValue(server.View.Id, out var prev);
+        var hasRecentNetBaseline = lite && prev is { Online: true, NetRxTotalBytes: not null, NetTxTotalBytes: not null }
+            && DateTimeOffset.TryParse(prev.CheckedAt, out var prevCheckedAt)
+            && (DateTimeOffset.UtcNow - prevCheckedAt).TotalSeconds is > 0.5 and < 180;
         var sw = Stopwatch.StartNew();
-        const string probeScript = """
-            export LC_ALL=C
-            echo "HOST=$(hostname 2>/dev/null || echo unknown)"
-            echo "OS=$(. /etc/os-release 2>/dev/null && printf '%s' "${PRETTY_NAME:-$NAME}" || uname -s)"
-            echo "KERNEL=$(uname -r 2>/dev/null)"
-            echo "UPTIME=$(uptime -p 2>/dev/null || uptime 2>/dev/null | sed 's/.*up *//; s/, *[0-9]* user.*//')"
-            echo "CORES=$(nproc 2>/dev/null || grep -c ^processor /proc/cpuinfo 2>/dev/null || echo 1)"
-            echo "LOAD=$(cat /proc/loadavg 2>/dev/null | awk '{print $1" "$2" "$3}' || uptime 2>/dev/null | awk -F'load average:' '{print $2}' | xargs)"
-            echo "CPU=$(awk '/^cpu /{u=$2+$4; t=$2+$4+$5; if(t>0) printf "%.1f", (u*100)/t}' /proc/stat 2>/dev/null || echo '')"
-            echo "MEM=$(free -m 2>/dev/null | awk '/^Mem:/{print $2" "$3}' || echo '')"
-            SWAP_VAL=$(free -m 2>/dev/null | awk '/^Swap:/{print $2" "$3}')
-            if [ -z "$SWAP_VAL" ] && [ -r /proc/meminfo ]; then
-              SWAP_VAL=$(awk '/^SwapTotal:/{t=int($2/1024); has=1} /^SwapFree:/{f=int($2/1024)} END{if(has) print t" "(t>f ? t-f : 0)}' /proc/meminfo 2>/dev/null)
-            fi
-            echo "SWAP=$SWAP_VAL"
-            DISK_LINE=$(df -Pk / 2>/dev/null | awk 'NR==2{gsub(/%/,"",$5); print $2" "$3" "$5}')
-            if [ -z "$DISK_LINE" ]; then
-              DISK_LINE=$(df -k / 2>/dev/null | awk 'NR>1 && NF>=5 {gsub(/%/,"",$(NF-1)); print $(NF-4)" "$(NF-3)" "$(NF-1); exit}')
-            fi
-            echo "DISK_KB=$DISK_LINE"
-            (df -PkT 2>/dev/null || df -Pk 2>/dev/null) | awk '
-              NR>1 && NF>=6 {
-                if (NF>=7) { fs=$1; type=$2; tot=$3; used=$4; avail=$5; mp=$7; for(i=8;i<=NF;i++) mp=mp" "$i }
-                else { fs=$1; type=""; tot=$2; used=$3; avail=$4; mp=$6; for(i=7;i<=NF;i++) mp=mp" "$i }
-                if (type ~ /^(tmpfs|devtmpfs|squashfs|overlay|proc|sysfs|cgroup|cgroup2|devpts|mqueue|hugetlbfs|autofs|fusectl|securityfs|pstore|efivarfs|debugfs|tracefs|ramfs|rpc_pipefs|nsfs)$/) next
-                if (fs ~ /^(tmpfs|devtmpfs|udev|none|overlay)$/) next
-                if (mp ~ /^\/(dev|proc|sys|run|snap)(\/|$)/ || mp ~ /\/(docker|containerd)\/(overlay2|aufs|containers|image|volumes)\// || mp == "/boot/efi") next
-                if (tot+0 <= 0) next
-                print "DISK_MOUNT=" mp "\t" fs "\t" tot "\t" used "\t" avail
-              }'
-            net_sum() {
-              awk -F':' 'NR>2 && NF==2 {
-                iface=$1; gsub(/^[ \t]+|[ \t]+$/,"",iface);
-                if (iface=="" || iface=="lo" || iface ~ /^(veth|docker|br-|virbr|cni|flannel|cali|kube)/) next;
-                val=$2; sub(/^[ \t]+/,"",val);
-                n=split(val, f, /[ \t]+/);
-                if (n>=9) { rx += f[1]; tx += f[9] }
-              } END { printf "%.0f %.0f", rx, tx }' /proc/net/dev 2>/dev/null
-            }
-            if [ -r /proc/net/dev ]; then
-              T1=$(date +%s%N 2>/dev/null || echo "")
-              N1=$(net_sum)
-              if sleep 0.4 2>/dev/null; then SL=400; else sleep 1; SL=1000; fi
-              T2=$(date +%s%N 2>/dev/null || echo "")
-              N2=$(net_sum)
-              echo "NET1=$N1"
-              echo "NET2=$N2"
-              echo "NET_T1=$T1"
-              echo "NET_T2=$T2"
-              echo "NET_SL=$SL"
-            fi
-            PORTS=$(ss -tlnH 2>/dev/null | awk '{print $4}' | sed 's/.*://' | sort -nu | tr '\n' ',' | sed 's/,$//' || true)
-            echo "PORTS=$PORTS"
-            if command -v docker >/dev/null 2>&1; then
-              DR=$(docker ps -q 2>/dev/null | wc -l | tr -d ' ')
-              DT=$(docker ps -aq 2>/dev/null | wc -l | tr -d ' ')
-              echo "DOCKER=$DR/$DT"
-            fi
-            if command -v systemctl >/dev/null 2>&1; then
-              FS=$(systemctl --failed --no-legend 2>/dev/null | wc -l | tr -d ' ')
-              echo "FAILED_SVC=$FS"
-            fi
-            """;
+        var script = BuildProbeScript(lite, hasRecentNetBaseline);
         try
         {
             var canDirectTcp = string.IsNullOrWhiteSpace(server.View.Proxy) && string.IsNullOrWhiteSpace(server.View.JumpServerId);
-            var rttTask = canDirectTcp ? MeasureTcpRttAsync(server.View.Host, server.View.Port, ct) : Task.FromResult<long?>(null);
-            var res = await ExecuteCoreAsync(server, probeScript, 20, ct);
+            long? rttMs = canDirectTcp ? await MeasureTcpRttAsync(server.View.Host, server.View.Port, ct) : null;
+            var res = await ExecuteCoreAsync(server, script, 20, ct);
             sw.Stop();
-            var rttMs = await rttTask;
             if (rttMs is null && !canDirectTcp)
             {
                 try
@@ -701,8 +643,8 @@ public sealed class SshOperations : IDisposable
 
             long? netRxRate = null, netTxRate = null, netRxTotal = null, netTxTotal = null;
             string? netSource = null;
-            var n1 = (kv.GetValueOrDefault("NET1") ?? "").Split(' ', StringSplitOptions.RemoveEmptyEntries);
             var n2 = (kv.GetValueOrDefault("NET2") ?? "").Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            var n1 = (kv.GetValueOrDefault("NET1") ?? "").Split(' ', StringSplitOptions.RemoveEmptyEntries);
             if (n1.Length >= 2 && n2.Length >= 2 &&
                 long.TryParse(n1[0], out var rx1) && long.TryParse(n1[1], out var tx1) &&
                 long.TryParse(n2[0], out var rx2) && long.TryParse(n2[1], out var tx2))
@@ -722,19 +664,46 @@ public sealed class SshOperations : IDisposable
                 netTxTotal = tx2;
                 netSource = "boot";
             }
+            else if (n2.Length >= 2 && long.TryParse(n2[0], out var rxNow) && long.TryParse(n2[1], out var txNow))
+            {
+                netRxTotal = rxNow;
+                netTxTotal = txNow;
+                netSource = "boot";
+                if (hasRecentNetBaseline && prev?.NetRxTotalBytes is long pRx && prev.NetTxTotalBytes is long pTx &&
+                    DateTimeOffset.TryParse(prev.CheckedAt, out var pTime))
+                {
+                    var elapsedSec = (DateTimeOffset.UtcNow - pTime).TotalSeconds;
+                    if (elapsedSec > 0.2 && rxNow >= pRx && txNow >= pTx)
+                    {
+                        netRxRate = (long)Math.Round((rxNow - pRx) / elapsedSec);
+                        netTxRate = (long)Math.Round((txNow - pTx) / elapsedSec);
+                    }
+                }
+            }
 
+            var nowIso = DateTimeOffset.UtcNow.ToString("O");
             var snap = new ServerSnapshot(
-                server.View.Id, server.View.Name, true, latencyMs, DateTimeOffset.UtcNow.ToString("O"),
-                kv.GetValueOrDefault("HOST"), kv.GetValueOrDefault("OS"), kv.GetValueOrDefault("KERNEL"), kv.GetValueOrDefault("UPTIME"),
+                server.View.Id, server.View.Name, true, latencyMs, nowIso,
+                lite ? (prev?.Hostname ?? kv.GetValueOrDefault("HOST")) : kv.GetValueOrDefault("HOST"),
+                lite ? (prev?.OsName ?? kv.GetValueOrDefault("OS")) : kv.GetValueOrDefault("OS"),
+                lite ? (prev?.Kernel ?? kv.GetValueOrDefault("KERNEL")) : kv.GetValueOrDefault("KERNEL"),
+                kv.GetValueOrDefault("UPTIME"),
                 cores, cpuPct, memTotal, memUsed, memPct, diskTotal, diskUsed, diskPct,
-                kv.GetValueOrDefault("LOAD"), portsList.Length, portsList.Length > 0 ? string.Join(", ", portsList.Take(20)) : "",
-                dockerRun, dockerTot, failedSvc, null, diskTotalMb, diskUsedMb, swapTotal, swapUsed, swapPct,
+                kv.GetValueOrDefault("LOAD"),
+                lite ? prev?.ListeningPortsCount : portsList.Length,
+                lite ? prev?.ListeningPorts : (portsList.Length > 0 ? string.Join(", ", portsList.Take(20)) : ""),
+                lite ? prev?.DockerRunning : dockerRun,
+                lite ? prev?.DockerTotal : dockerTot,
+                lite ? prev?.FailedServices : failedSvc,
+                null, diskTotalMb, diskUsedMb, swapTotal, swapUsed, swapPct,
                 diskMounts.Count > 0 ? diskMounts : null, netRxRate, netTxRate, netRxTotal, netTxTotal, netSource);
 
             _snapshots[server.View.Id] = snap;
             store.SaveSnapshot(snap);
 
-            if ((diskPct.HasValue && diskPct.Value >= 90) || (memPct.HasValue && memPct.Value >= 90))
+            var alertTriggered = (diskPct.HasValue && diskPct.Value >= 90) || (memPct.HasValue && memPct.Value >= 90);
+            var prevAlert = prev is { Online: true } && ((prev.DiskPercent ?? 0) >= 90 || (prev.MemPercent ?? 0) >= 90);
+            if (alertTriggered && (!lite || !prevAlert))
                 notifications.Fire("alert", $"服务器资源告警：{server.View.Name}", $"内存：{memPct?.ToString("0.0") ?? "-"}%，磁盘：{diskPct?.ToString("0.0") ?? "-"}%");
             return snap;
         }
@@ -746,9 +715,100 @@ public sealed class SshOperations : IDisposable
                 null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, Errors.Public(e));
             _snapshots[server.View.Id] = snap;
             store.SaveSnapshot(snap);
-            notifications.Fire("alert", $"服务器离线告警：{server.View.Name}", $"主机 {server.View.Host}:{server.View.Port} 连接失败：{Errors.Public(e)}");
+            if (!lite || prev is null || prev.Online)
+                notifications.Fire("alert", $"服务器离线告警：{server.View.Name}", $"主机 {server.View.Host}:{server.View.Port} 连接失败：{Errors.Public(e)}");
             return snap;
         }
+    }
+
+    private static string BuildProbeScript(bool lite, bool singleNetSample)
+    {
+        var sb = new StringBuilder();
+        sb.Append("""
+            export LC_ALL=C
+            echo "UPTIME=$(uptime -p 2>/dev/null || uptime 2>/dev/null | sed 's/.*up *//; s/, *[0-9]* user.*//')"
+            echo "CORES=$(nproc 2>/dev/null || grep -c ^processor /proc/cpuinfo 2>/dev/null || echo 1)"
+            echo "LOAD=$(cat /proc/loadavg 2>/dev/null | awk '{print $1" "$2" "$3}' || uptime 2>/dev/null | awk -F'load average:' '{print $2}' | xargs)"
+            echo "CPU=$(awk '/^cpu /{u=$2+$4; t=$2+$4+$5; if(t>0) printf "%.1f", (u*100)/t}' /proc/stat 2>/dev/null || echo '')"
+            echo "MEM=$(free -m 2>/dev/null | awk '/^Mem:/{print $2" "$3}' || echo '')"
+            SWAP_VAL=$(free -m 2>/dev/null | awk '/^Swap:/{print $2" "$3}')
+            if [ -z "$SWAP_VAL" ] && [ -r /proc/meminfo ]; then
+              SWAP_VAL=$(awk '/^SwapTotal:/{t=int($2/1024); has=1} /^SwapFree:/{f=int($2/1024)} END{if(has) print t" "(t>f ? t-f : 0)}' /proc/meminfo 2>/dev/null)
+            fi
+            echo "SWAP=$SWAP_VAL"
+            DISK_LINE=$(df -Pk / 2>/dev/null | awk 'NR==2{gsub(/%/,"",$5); print $2" "$3" "$5}')
+            if [ -z "$DISK_LINE" ]; then
+              DISK_LINE=$(df -k / 2>/dev/null | awk 'NR>1 && NF>=5 {gsub(/%/,"",$(NF-1)); print $(NF-4)" "$(NF-3)" "$(NF-1); exit}')
+            fi
+            echo "DISK_KB=$DISK_LINE"
+            (df -PkT 2>/dev/null || df -Pk 2>/dev/null) | awk '
+              NR>1 && NF>=6 {
+                if (NF>=7) { fs=$1; type=$2; tot=$3; used=$4; avail=$5; mp=$7; for(i=8;i<=NF;i++) mp=mp" "$i }
+                else { fs=$1; type=""; tot=$2; used=$3; avail=$4; mp=$6; for(i=7;i<=NF;i++) mp=mp" "$i }
+                if (type ~ /^(tmpfs|devtmpfs|squashfs|overlay|proc|sysfs|cgroup|cgroup2|devpts|mqueue|hugetlbfs|autofs|fusectl|securityfs|pstore|efivarfs|debugfs|tracefs|ramfs|rpc_pipefs|nsfs)$/) next
+                if (fs ~ /^(tmpfs|devtmpfs|udev|none|overlay)$/) next
+                if (mp ~ /^\/(dev|proc|sys|run|snap)(\/|$)/ || mp ~ /\/(docker|containerd)\/(overlay2|aufs|containers|image|volumes)\// || mp == "/boot/efi") next
+                if (tot+0 <= 0) next
+                print "DISK_MOUNT=" mp "\t" fs "\t" tot "\t" used "\t" avail
+              }'
+            net_sum() {
+              awk -F':' 'NR>2 && NF==2 {
+                iface=$1; gsub(/^[ \t]+|[ \t]+$/,"",iface);
+                if (iface=="" || iface=="lo" || iface ~ /^(veth|docker|br-|virbr|cni|flannel|cali|kube)/) next;
+                val=$2; sub(/^[ \t]+/,"",val);
+                n=split(val, f, /[ \t]+/);
+                if (n>=9) { rx += f[1]; tx += f[9] }
+              } END { printf "%.0f %.0f", rx, tx }' /proc/net/dev 2>/dev/null
+            }
+            """);
+        if (singleNetSample)
+        {
+            sb.Append("""
+
+                if [ -r /proc/net/dev ]; then
+                  echo "NET2=$(net_sum)"
+                fi
+                """);
+        }
+        else
+        {
+            sb.Append("""
+
+                if [ -r /proc/net/dev ]; then
+                  T1=$(date +%s%N 2>/dev/null || echo "")
+                  N1=$(net_sum)
+                  if sleep 0.4 2>/dev/null; then SL=400; else sleep 1; SL=1000; fi
+                  T2=$(date +%s%N 2>/dev/null || echo "")
+                  N2=$(net_sum)
+                  echo "NET1=$N1"
+                  echo "NET2=$N2"
+                  echo "NET_T1=$T1"
+                  echo "NET_T2=$T2"
+                  echo "NET_SL=$SL"
+                fi
+                """);
+        }
+        if (!lite)
+        {
+            sb.Append("""
+
+                echo "HOST=$(hostname 2>/dev/null || echo unknown)"
+                echo "OS=$(. /etc/os-release 2>/dev/null && printf '%s' "${PRETTY_NAME:-$NAME}" || uname -s)"
+                echo "KERNEL=$(uname -r 2>/dev/null)"
+                PORTS=$(ss -tlnH 2>/dev/null | awk '{print $4}' | sed 's/.*://' | sort -nu | tr '\n' ',' | sed 's/,$//' || true)
+                echo "PORTS=$PORTS"
+                if command -v docker >/dev/null 2>&1; then
+                  DR=$(docker ps -q 2>/dev/null | wc -l | tr -d ' ')
+                  DT=$(docker ps -aq 2>/dev/null | wc -l | tr -d ' ')
+                  echo "DOCKER=$DR/$DT"
+                fi
+                if command -v systemctl >/dev/null 2>&1; then
+                  FS=$(systemctl --failed --no-legend 2>/dev/null | wc -l | tr -d ' ')
+                  echo "FAILED_SVC=$FS"
+                fi
+                """);
+        }
+        return sb.ToString();
     }
 
     public async Task<List<ServerSnapshot>> RefreshAllSnapshots(string actor, CancellationToken ct = default)
@@ -764,30 +824,39 @@ public sealed class SshOperations : IDisposable
         return (await Task.WhenAll(tasks)).OrderBy(s => s.ServerName, StringComparer.OrdinalIgnoreCase).ToList();
     }
 
-    private static async Task<long?> MeasureTcpRttAsync(string host, int port, CancellationToken ct)
-    {
-        try
+    private static Task<long?> MeasureTcpRttAsync(string host, int port, CancellationToken ct) =>
+        Task.Factory.StartNew(() =>
         {
-            IPAddress addr;
-            if (!IPAddress.TryParse(host, out addr!))
+            try
             {
-                var addrs = await Dns.GetHostAddressesAsync(host, ct);
-                if (addrs.Length == 0) return null;
-                addr = addrs.FirstOrDefault(a => a.AddressFamily == AddressFamily.InterNetwork) ?? addrs[0];
+                IPAddress addr;
+                if (!IPAddress.TryParse(host, out addr!))
+                {
+                    var addrs = Dns.GetHostAddresses(host);
+                    if (addrs.Length == 0) return (long?)null;
+                    addr = addrs.FirstOrDefault(a => a.AddressFamily == AddressFamily.InterNetwork) ?? addrs[0];
+                }
+                using var socket = new Socket(addr.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
+                socket.Blocking = false;
+                var sw = Stopwatch.StartNew();
+                try
+                {
+                    socket.Connect(new IPEndPoint(addr, port));
+                }
+                catch (SocketException ex) when (ex.SocketErrorCode == SocketError.WouldBlock || ex.SocketErrorCode == SocketError.InProgress)
+                {
+                    if (!socket.Poll(3_000_000, SelectMode.SelectWrite)) return null;
+                }
+                sw.Stop();
+                if (socket.GetSocketOption(SocketOptionLevel.Socket, SocketOptionName.Error) is int err && err != 0)
+                    return null;
+                return Math.Max(1, (long)Math.Round(sw.Elapsed.TotalMilliseconds));
             }
-            using var socket = new Socket(addr.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
-            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            timeoutCts.CancelAfter(TimeSpan.FromSeconds(5));
-            var sw = Stopwatch.StartNew();
-            await socket.ConnectAsync(new IPEndPoint(addr, port), timeoutCts.Token);
-            sw.Stop();
-            return Math.Max(1, sw.ElapsedMilliseconds);
-        }
-        catch
-        {
-            return null;
-        }
-    }
+            catch
+            {
+                return null;
+            }
+        }, ct, TaskCreationOptions.LongRunning, TaskScheduler.Default);
 
     // --- Batch Execute ---
     public async Task<BatchExecuteResult> BatchExecute(List<ServerView> targets, string command, int timeoutSeconds, string actor, CancellationToken ct)

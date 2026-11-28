@@ -420,7 +420,7 @@ function applyProbeInterval() {
   if (sec > 0) {
     probeTimer = setInterval(() => {
       if (document.visibilityState === 'visible' && currentView === 'servers' && servers.length && collectingSnapshots.size === 0) {
-        collectSnapshots(servers.map(s => s.id), { silent: true });
+        collectSnapshots(servers.map(s => s.id), { silent: true, lite: true });
       }
     }, sec * 1000);
   }
@@ -433,6 +433,37 @@ function applyViewMode(mode) {
   $('#view-mode-table')?.classList.toggle('active', serverViewMode === 'table');
   $('#server-cards')?.classList.toggle('hidden', serverViewMode !== 'cards');
   $('#server-table-wrap')?.classList.toggle('hidden', serverViewMode !== 'table');
+}
+
+async function collectSnapshots(ids, { silent = false, lite = false } = {}) {
+  const queue = [...new Set(ids)].filter(id => id && !collectingSnapshots.has(id));
+  if (!queue.length) return;
+  queue.forEach(id => collectingSnapshots.add(id));
+  renderServers();
+  let done = 0;
+  const worker = async () => {
+    while (queue.length) {
+      const id = queue.shift();
+      try {
+        const s = await api(`/api/servers/${id}/snapshot${lite ? '?lite=true' : ''}`, { method: 'POST' });
+        snapshots.set(s.serverId, s);
+        done++;
+      } catch {
+      } finally {
+        collectingSnapshots.delete(id);
+        renderServers();
+        updateMetrics();
+        if (selected?.id === id) renderSnapshotTab();
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(4, Math.max(1, ids.length)) }, worker));
+  if (!silent) toast(`已刷新 ${done} 台主机状态`);
+}
+
+function collectMissingSnapshots() {
+  const missing = servers.filter(s => !snapshots.has(s.id)).map(s => s.id);
+  if (missing.length) collectSnapshots(missing, { silent: true });
 }
 
 function renderServers() {

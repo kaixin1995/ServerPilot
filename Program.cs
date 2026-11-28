@@ -236,7 +236,7 @@ api.MapPost("/servers/probe", async (ProbeInput input, SshOperations ssh) => awa
 api.MapPost("/servers/import-ssh-config", (SshConfigImportInput input, ServerStore store) => Safe(() => TypedResults.Ok(store.ParseSshConfig(input.ConfigText))));
 api.MapGet("/servers/snapshots", (SshOperations ssh) => TypedResults.Ok(ssh.GetCachedSnapshots()));
 api.MapPost("/servers/snapshots", async (SshOperations ssh, CancellationToken ct) => await SafeAsync(async () => TypedResults.Ok(await ssh.RefreshAllSnapshots("web", ct))));
-api.MapPost("/servers/{id}/snapshot", async (string id, SshOperations ssh, CancellationToken ct) => await SafeAsync(async () => TypedResults.Ok(await ssh.GetSnapshot(id, "web", ct))));
+api.MapPost("/servers/{id}/snapshot", async (string id, SshOperations ssh, CancellationToken ct, bool lite = false) => await SafeAsync(async () => TypedResults.Ok(await ssh.GetSnapshot(id, "web", ct, lite))));
 api.MapPost("/servers/batch-execute", async (BatchExecuteInput input, ServerStore store, SshOperations ssh, CancellationToken ct) => await SafeAsync(async () =>
 {
     var all = store.List();
