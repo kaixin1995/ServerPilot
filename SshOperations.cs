@@ -540,6 +540,7 @@ public sealed class SshOperations : IDisposable
         var server = store.Get(id);
         var sw = Stopwatch.StartNew();
         const string probeScript = """
+            export LC_ALL=C
             echo "HOST=$(hostname 2>/dev/null || echo unknown)"
             echo "OS=$(. /etc/os-release 2>/dev/null && printf '%s' "${PRETTY_NAME:-$NAME}" || uname -s)"
             echo "KERNEL=$(uname -r 2>/dev/null)"
@@ -548,7 +549,11 @@ public sealed class SshOperations : IDisposable
             echo "LOAD=$(cat /proc/loadavg 2>/dev/null | awk '{print $1" "$2" "$3}' || uptime 2>/dev/null | awk -F'load average:' '{print $2}' | xargs)"
             echo "CPU=$(awk '/^cpu /{u=$2+$4; t=$2+$4+$5; if(t>0) printf "%.1f", (u*100)/t}' /proc/stat 2>/dev/null || echo '')"
             echo "MEM=$(free -m 2>/dev/null | awk '/^Mem:/{print $2" "$3}' || echo '')"
-            echo "SWAP=$(free -m 2>/dev/null | awk '/^Swap:/{print $2" "$3}' || echo '')"
+            SWAP_VAL=$(free -m 2>/dev/null | awk '/^Swap:/{print $2" "$3}')
+            if [ -z "$SWAP_VAL" ] && [ -r /proc/meminfo ]; then
+              SWAP_VAL=$(awk '/^SwapTotal:/{t=int($2/1024); has=1} /^SwapFree:/{f=int($2/1024)} END{if(has) print t" "(t>f ? t-f : 0)}' /proc/meminfo 2>/dev/null)
+            fi
+            echo "SWAP=$SWAP_VAL"
             DISK_LINE=$(df -Pk / 2>/dev/null | awk 'NR==2{gsub(/%/,"",$5); print $2" "$3" "$5}')
             if [ -z "$DISK_LINE" ]; then
               DISK_LINE=$(df -k / 2>/dev/null | awk 'NR>1 && NF>=5 {gsub(/%/,"",$(NF-1)); print $(NF-4)" "$(NF-3)" "$(NF-1); exit}')
@@ -604,8 +609,12 @@ public sealed class SshOperations : IDisposable
             var swapParts = (kv.GetValueOrDefault("SWAP") ?? "").Split(' ', StringSplitOptions.RemoveEmptyEntries);
             if (swapParts.Length >= 2 && long.TryParse(swapParts[0], out var st) && long.TryParse(swapParts[1], out var su) && st >= 0)
             {
-                swapTotal = st; swapUsed = su;
-                swapPct = st > 0 ? Math.Round(su * 100.0 / st, 1) : null;
+                swapTotal = st; swapUsed = Math.Max(0, su);
+                swapPct = st > 0 ? Math.Round(swapUsed.Value * 100.0 / st, 1) : null;
+            }
+            else if (memTotal.HasValue)
+            {
+                swapTotal = 0; swapUsed = 0;
             }
             long? diskTotal = null, diskUsed = null, diskTotalMb = null, diskUsedMb = null; double? diskPct = null;
             var diskKbParts = (kv.GetValueOrDefault("DISK_KB") ?? "").Split(' ', StringSplitOptions.RemoveEmptyEntries);
@@ -615,7 +624,7 @@ public sealed class SshOperations : IDisposable
                 diskUsedMb = duKb / 1024;
                 diskTotal = (long)Math.Round(dtKb / 1048576.0);
                 diskUsed = (long)Math.Round(duKb / 1048576.0);
-                diskPct = Math.Round(dpKb, 1);
+                diskPct = dtKb > 0 ? Math.Round(duKb * 100.0 / dtKb, 1) : Math.Round(dpKb, 1);
             }
             else
             {
